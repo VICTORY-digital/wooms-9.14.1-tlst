@@ -732,8 +732,6 @@ class OrderUpdateFromMoySklad
      */
     public static function get_data_order_from_moysklad($data_request)
     {
-        self::set_state('is_wait', 0);
-
         try {
             $body = $data_request->get_body();
             $data = json_decode($body, true);
@@ -750,12 +748,23 @@ class OrderUpdateFromMoySklad
             }
 
             if (empty($data["events"][0]["meta"]["href"])) {
-                return;
+                return new \WP_REST_Response(array('error' => 'Invalid webhook payload'), 400);
             }
 
-            $url = $data["events"][0]["meta"]["href"];
+            $order_path = MoySkladApiUrl::get_customer_order_path($data["events"][0]["meta"]["href"]);
+            if (false === $order_path) {
+                do_action(
+                    'wooms_logger_error',
+                    __CLASS__,
+                    'Отклонен webhook с небезопасным адресом заказа МойСклад'
+                );
 
-            $data_order = request($url);
+                return new \WP_REST_Response(array('error' => 'Invalid webhook payload'), 400);
+            }
+
+            self::set_state('is_wait', 0);
+
+            $data_order = request($order_path);
             if (empty($data_order['id'])) {
                 return;
             }

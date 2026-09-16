@@ -18,6 +18,17 @@ function wooms_request($url = '', $data = array(), $type = 'GET')
     return false;
   }
 
+  $url = \WooMS\MoySkladApiUrl::normalize($url);
+  if (false === $url) {
+    do_action(
+      'wooms_logger_error',
+      $type = 'WooMS-Request',
+      $title = 'Отклонен небезопасный адрес REST API МойСклад'
+    );
+
+    return false;
+  }
+
   $url = wooms_fix_url($url);
 
   if (isset($data) && !empty($data) && 'GET' == $type) {
@@ -30,10 +41,12 @@ function wooms_request($url = '', $data = array(), $type = 'GET')
   }
 
   $args = array(
-    'method'      => $type,
-    'timeout'     => 45,
-    'redirection' => 5,
-    'headers'     => array(
+    'method'             => $type,
+    'timeout'            => 45,
+    'redirection'        => 0,
+    'reject_unsafe_urls' => true,
+    'sslverify'          => true,
+    'headers'            => array(
       "Content-Type"  => 'application/json;charset=utf-8',
       'Authorization' => 'Basic ' .
         base64_encode(get_option('woomss_login') . ':' . get_option('woomss_pass')),
@@ -259,5 +272,4 @@ function wooms_get_timestamp_last_job_by_hook($hook = null){
   $date->setTimezone(new \DateTimeZone(wp_timezone_string()));
   return $date->format('Y-m-d H:i:s');
 }
-
 

@@ -38,6 +38,7 @@ register_deactivation_hook(__FILE__, function () {
 });
 
 
+require_once __DIR__.'/includes/MoySkladApiUrl.php';
 require_once __DIR__.'/includes/functions.php';
 
 if (defined('WP_CLI') && WP_CLI) {
@@ -130,20 +131,16 @@ function get_api_url($path)
 
 function request($path = '', $data = array(), $type = 'GET')
 {
-	// https://api.moysklad.ru/api/remap/1.2/
+	$url = MoySkladApiUrl::normalize($path);
+	if (false === $url) {
+		do_action(
+			'wooms_logger_error',
+			$type = 'WooMS-Request',
+			$title = 'Отклонен небезопасный адрес REST API МойСклад'
+		);
 
-
-	if (empty($path)) {
 		return false;
 	}
-
-	if (str_contains($path, 'https://api.moysklad.ru/api/remap/1.2/')) {
-		$url = $path;
-	} else {
-		$url = 'https://api.moysklad.ru/api/remap/1.2/'.$path;
-	}
-
-
 
 	//@link https://github.com/wpcraft-ru/wooms/issues/177
 	$url = str_replace('product_id', 'product.id', $url);
@@ -164,7 +161,9 @@ function request($path = '', $data = array(), $type = 'GET')
 	$args = array(
 		'method' => $type,
 		'timeout' => 45,
-		'redirection' => 5,
+		'redirection' => 0,
+		'reject_unsafe_urls' => true,
+		'sslverify' => true,
 		'headers' => array(
 			"Content-Type" => 'application/json;charset=utf-8',
 			"Accept-Encoding" => "gzip",
