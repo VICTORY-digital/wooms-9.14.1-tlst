@@ -62,7 +62,7 @@ class SiteHealthWebHooks
 
         // создаем веб хук в МойСклад
         $data   = array(
-            'url'        => rest_url('/wooms/v1/order-update/'),
+            'url'        => OrderUpdateFromMoySklad::get_webhook_url(),
             'action'     => "UPDATE",
             "entityType" => "customerorder",
         );

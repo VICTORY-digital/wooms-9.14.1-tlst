@@ -18,6 +18,9 @@ class OrderUpdateFromMoySklad
      */
     public static $hook_order_update_from_moysklad = 'wooms_order_update_from_moysklad';
     public static $state_key = 'wooms_order_update_from_moysklad_state';
+    private static $webhook_secret_option = 'wooms_webhook_secret';
+    private static $webhook_replay_prefix = 'wooms_webhook_replay_';
+    private static $webhook_rate_prefix = 'wooms_webhook_rate_';
 
     /**
      * The init
@@ -530,7 +533,7 @@ class OrderUpdateFromMoySklad
 
         if (!empty($data['rows'])) {
             foreach ($data['rows'] as $row) {
-                if ($row['url'] == rest_url('/wooms/v1/order-update/')) {
+                if (self::is_protected_webhook_url($row['url'])) {
                     $webhooks[$row['id']] = array(
                         'entityType' => $row['entityType'],
                         'url'        => $row['url'],
@@ -555,7 +558,7 @@ class OrderUpdateFromMoySklad
                 echo "Хук на стороне МойСклад добавлен в соответствии с настройки";
             }
         }
-        echo '<p><small>Ссылка для приема данных из системы МойСклад: ' . rest_url('/wooms/v1/order-update/') . '</small></p>';
+        echo '<p><small>Ссылка для приема данных из системы МойСклад защищена персональным ключом.</small></p>';
 
         if (!empty($data["errors"][0]["error"])) {
             $msg = $data["errors"][0]["error"];
@@ -579,7 +582,7 @@ class OrderUpdateFromMoySklad
         if (!empty($data['rows'])) {
 
             foreach ($data['rows'] as $row) {
-                if ($row['entityType'] != 'customerorder') {
+                if ('customerorder' !== $row['entityType'] || 'UPDATE' !== $row['action']) {
                     continue;
                 }
 
@@ -610,11 +613,13 @@ class OrderUpdateFromMoySklad
             }
         } else {
 
+            $webhook_url = self::get_webhook_url();
+
             //Если нужного вебхука нет - создаем новый
             if (empty($webhooks)) {
                 // создаем веб хук в МойСклад
                 $data   = array(
-                    'url'        => rest_url('/wooms/v1/order-update/'),
+                    'url'        => $webhook_url,
                     'action'     => "UPDATE",
                     "entityType" => "customerorder",
                 );
@@ -626,7 +631,24 @@ class OrderUpdateFromMoySklad
                     return true;
                 }
             } else {
-                return true;
+                foreach ($webhooks as $id => $webhook) {
+                    if (self::is_protected_webhook_url($webhook['url']) && !empty($webhook['enabled'])) {
+                        return true;
+                    }
+
+                    $result = request(
+                        'entity/webhook/' . $id,
+                        array(
+                            'url'        => $webhook_url,
+                            'action'     => 'UPDATE',
+                            'entityType' => 'customerorder',
+                            'enabled'    => true,
+                        ),
+                        'PUT'
+                    );
+
+                    return !empty($result);
+                }
             }
         }
     }
@@ -718,8 +740,180 @@ class OrderUpdateFromMoySklad
         register_rest_route('wooms/v1', '/order-update/', array(
             'methods'  => \WP_REST_Server::EDITABLE,
             'callback' => array(__CLASS__, 'get_data_order_from_moysklad'),
-            'permission_callback' => '__return_true',
+            'permission_callback' => array(__CLASS__, 'authorize_webhook'),
         ));
+    }
+
+    /**
+     * Return the authenticated webhook URL registered in MoySklad.
+     *
+     * @return string
+     */
+    public static function get_webhook_url()
+    {
+        return add_query_arg('key', self::get_webhook_secret(), rest_url('/wooms/v1/order-update/'));
+    }
+
+    /**
+     * Authenticate, rate limit, and reserve a webhook event before handling it.
+     *
+     * @param \WP_REST_Request $request REST request.
+     * @return true|\WP_Error
+     */
+    public static function authorize_webhook($request)
+    {
+        $params = $request->get_query_params();
+        $key = is_string($params['key'] ?? null) ? $params['key'] : '';
+
+        if ('' === $key || !hash_equals(self::get_webhook_secret(), $key)) {
+            return new \WP_Error(
+                'wooms_webhook_unauthorized',
+                'Webhook authentication failed.',
+                array('status' => 401)
+            );
+        }
+
+        if (!self::is_enable()) {
+            return new \WP_Error(
+                'wooms_webhook_disabled',
+                'Webhook processing is disabled.',
+                array('status' => 503)
+            );
+        }
+
+        if (65536 < strlen($request->get_body())) {
+            return new \WP_Error(
+                'wooms_webhook_too_large',
+                'Webhook payload is too large.',
+                array('status' => 413)
+            );
+        }
+
+        $request_id = self::get_webhook_request_id($request);
+        if (false === $request_id) {
+            return new \WP_Error(
+                'wooms_webhook_invalid_request_id',
+                'A valid MoySklad requestId is required.',
+                array('status' => 400)
+            );
+        }
+
+        $replay_key = self::get_webhook_replay_key($request_id);
+        if (false !== get_transient($replay_key)) {
+            return new \WP_Error(
+                'wooms_webhook_replayed',
+                'This webhook event has already been received.',
+                array('status' => 409)
+            );
+        }
+
+        $rate_key = self::$webhook_rate_prefix . gmdate('YmdHi');
+        $request_count = (int) get_transient($rate_key);
+        if (120 <= $request_count) {
+            return new \WP_Error(
+                'wooms_webhook_rate_limited',
+                'Webhook rate limit exceeded.',
+                array('status' => 429)
+            );
+        }
+
+        set_transient($rate_key, $request_count + 1, 2 * MINUTE_IN_SECONDS);
+        set_transient($replay_key, 'processing', 5 * MINUTE_IN_SECONDS);
+
+        return true;
+    }
+
+    /**
+     * Get or create the secret embedded in the provider-side webhook URL.
+     *
+     * @return string
+     */
+    private static function get_webhook_secret()
+    {
+        $secret = get_option(self::$webhook_secret_option, '');
+        if (is_string($secret) && 32 <= strlen($secret)) {
+            return $secret;
+        }
+
+        $secret = wp_generate_password(48, false, false);
+        if (!add_option(self::$webhook_secret_option, $secret, '', 'no')) {
+            $stored_secret = get_option(self::$webhook_secret_option, '');
+            if (is_string($stored_secret) && 32 <= strlen($stored_secret)) {
+                return $stored_secret;
+            }
+
+            update_option(self::$webhook_secret_option, $secret, false);
+        }
+
+        return $secret;
+    }
+
+    /**
+     * Check whether a provider webhook uses the current authenticated URL.
+     *
+     * @param string $url Provider webhook URL.
+     * @return bool
+     */
+    private static function is_protected_webhook_url($url)
+    {
+        return is_string($url) && hash_equals(self::get_webhook_url(), $url);
+    }
+
+    /**
+     * Validate the provider-generated event identifier.
+     *
+     * @param \WP_REST_Request $request REST request.
+     * @return string|false
+     */
+    private static function get_webhook_request_id($request)
+    {
+        $params = $request->get_query_params();
+        $request_id = $params['requestId'] ?? '';
+
+        if (!is_string($request_id) || !preg_match('/\A[A-Za-z0-9._-]{8,128}\z/', $request_id)) {
+            return false;
+        }
+
+        return $request_id;
+    }
+
+    /**
+     * Build a non-sensitive transient key for replay tracking.
+     *
+     * @param string $request_id Provider event identifier.
+     * @return string
+     */
+    private static function get_webhook_replay_key($request_id)
+    {
+        return self::$webhook_replay_prefix . hash('sha256', $request_id);
+    }
+
+    /**
+     * Keep a replay marker after successful processing.
+     *
+     * @param \WP_REST_Request $request REST request.
+     * @return void
+     */
+    private static function mark_webhook_processed($request)
+    {
+        $request_id = self::get_webhook_request_id($request);
+        if (false !== $request_id) {
+            set_transient(self::get_webhook_replay_key($request_id), 'processed', DAY_IN_SECONDS);
+        }
+    }
+
+    /**
+     * Release an in-flight replay marker after a processing failure.
+     *
+     * @param \WP_REST_Request $request REST request.
+     * @return void
+     */
+    private static function release_webhook_request($request)
+    {
+        $request_id = self::get_webhook_request_id($request);
+        if (false !== $request_id) {
+            delete_transient(self::get_webhook_replay_key($request_id));
+        }
     }
 
 
@@ -735,19 +929,22 @@ class OrderUpdateFromMoySklad
         try {
             $body = $data_request->get_body();
             $data = json_decode($body, true);
+            $request_id = self::get_webhook_request_id($data_request);
 
             do_action(
                 'wooms_logger',
                 __CLASS__,
-                'Прилетел веб-хук',
+                sprintf('Прилетел веб-хук %s', $request_id),
                 $data
             );
 
             if (!self::is_enable()) {
-                return;
+                self::release_webhook_request($data_request);
+                return new \WP_REST_Response(array('error' => 'Webhook processing is disabled'), 503);
             }
 
             if (empty($data["events"][0]["meta"]["href"])) {
+                self::release_webhook_request($data_request);
                 return new \WP_REST_Response(array('error' => 'Invalid webhook payload'), 400);
             }
 
@@ -759,6 +956,7 @@ class OrderUpdateFromMoySklad
                     'Отклонен webhook с небезопасным адресом заказа МойСклад'
                 );
 
+                self::release_webhook_request($data_request);
                 return new \WP_REST_Response(array('error' => 'Invalid webhook payload'), 400);
             }
 
@@ -766,7 +964,8 @@ class OrderUpdateFromMoySklad
 
             $data_order = request($order_path);
             if (empty($data_order['id'])) {
-                return;
+                self::release_webhook_request($data_request);
+                return new \WP_REST_Response(array('error' => 'MoySklad order request failed'), 502);
             }
 
             $order_uuid = $data_order['id'];
@@ -782,14 +981,16 @@ class OrderUpdateFromMoySklad
 
 
             if (empty($orders[0]->ID)) {
-                return false;
+                self::mark_webhook_processed($data_request);
+                return new \WP_REST_Response(array('success' => 'Order is not linked'), 202);
             }
             $order_id = $orders[0]->ID;
 
             //Если стоит блокировка обновления Заказа, то выходим (защита от состояния гонки)
             if (get_post_meta($order_id, 'lock_callback_update', true)) {
                 delete_post_meta($order_id, 'lock_callback_update');
-                return;
+                self::mark_webhook_processed($data_request);
+                return new \WP_REST_Response(array('success' => 'Order update is already locked'), 200);
             }
 
             update_post_meta($order_id, self::$hook_order_update_from_moysklad, 1);
@@ -804,6 +1005,7 @@ class OrderUpdateFromMoySklad
 
             $result     = true;
             if ($result) {
+                self::mark_webhook_processed($data_request);
                 $response = new \WP_REST_Response(array('success', 'Data received successfully'));
                 $response->set_status(200);
                 return $response;
@@ -811,6 +1013,7 @@ class OrderUpdateFromMoySklad
                 throw new \Exception("Заказ не обновился");
             }
         } catch (Exception $e) {
+            self::release_webhook_request($data_request);
             $response = new \WP_REST_Response(array('fail', $e->getMessage()));
             $response->set_status(500);
             return $response;
