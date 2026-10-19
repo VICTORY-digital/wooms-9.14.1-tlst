@@ -799,7 +799,12 @@ class OrderUpdateFromMoySklad
         }
 
         $replay_key = self::get_webhook_replay_key($request_id);
-        if (false !== get_transient($replay_key)) {
+        $replay_state = get_transient($replay_key);
+        if ('processed' === $replay_state) {
+            // MoySklad requires HTTP 200/204 even for already processed notifications.
+            return true;
+        }
+        if (false !== $replay_state) {
             return new \WP_Error(
                 'wooms_webhook_replayed',
                 'This webhook event has already been received.',
@@ -912,7 +917,10 @@ class OrderUpdateFromMoySklad
     {
         $request_id = self::get_webhook_request_id($request);
         if (false !== $request_id) {
-            delete_transient(self::get_webhook_replay_key($request_id));
+            $replay_key = self::get_webhook_replay_key($request_id);
+            if ('processing' === get_transient($replay_key)) {
+                delete_transient($replay_key);
+            }
         }
     }
 
@@ -927,16 +935,20 @@ class OrderUpdateFromMoySklad
     public static function get_data_order_from_moysklad($data_request)
     {
         try {
+            $request_id = self::get_webhook_request_id($data_request);
             $body = $data_request->get_body();
             $data = json_decode($body, true);
-            $request_id = self::get_webhook_request_id($data_request);
+            $already_processed = false !== $request_id
+                && 'processed' === get_transient(self::get_webhook_replay_key($request_id));
 
-            do_action(
-                'wooms_logger',
-                __CLASS__,
-                sprintf('Прилетел веб-хук %s', $request_id),
-                $data
-            );
+            if (!$already_processed) {
+                do_action(
+                    'wooms_logger',
+                    __CLASS__,
+                    sprintf('Прилетел веб-хук %s', $request_id),
+                    $data
+                );
+            }
 
             if (!self::is_enable()) {
                 self::release_webhook_request($data_request);
@@ -960,15 +972,11 @@ class OrderUpdateFromMoySklad
                 return new \WP_REST_Response(array('error' => 'Invalid webhook payload'), 400);
             }
 
-            self::set_state('is_wait', 0);
-
-            $data_order = request($order_path);
-            if (empty($data_order['id'])) {
-                self::release_webhook_request($data_request);
-                return new \WP_REST_Response(array('error' => 'MoySklad order request failed'), 502);
+            if ($already_processed) {
+                return new \WP_REST_Response(null, 204);
             }
 
-            $order_uuid = $data_order['id'];
+            $order_uuid = basename($order_path);
 
             $args   = array(
                 'numberposts' => 1,
@@ -981,8 +989,21 @@ class OrderUpdateFromMoySklad
 
 
             if (empty($orders[0]->ID)) {
+                do_action(
+                    'wooms_logger',
+                    __CLASS__,
+                    sprintf('Веб-хук %s пропущен: заказ МойСклад %s не связан с заказом сайта', $request_id, $order_uuid)
+                );
                 self::mark_webhook_processed($data_request);
-                return new \WP_REST_Response(array('success' => 'Order is not linked'), 202);
+                return new \WP_REST_Response(null, 204);
+            }
+
+            self::set_state('is_wait', 0);
+
+            $data_order = request($order_path);
+            if (empty($data_order['id'])) {
+                self::release_webhook_request($data_request);
+                return new \WP_REST_Response(array('error' => 'MoySklad order request failed'), 502);
             }
             $order_id = $orders[0]->ID;
 
