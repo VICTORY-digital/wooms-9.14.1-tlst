@@ -17,6 +17,7 @@ class OrderUpdateFromMoySklad
      * этот хук является ключем для ActionSheduler и для метаполя, по которому определяются заказы для обновления.
      */
     public static $hook_order_update_from_moysklad = 'wooms_order_update_from_moysklad';
+    public static $hook_process_webhook = 'wooms_process_order_webhook';
     public static $state_key = 'wooms_order_update_from_moysklad_state';
     private static $webhook_secret_option = 'wooms_webhook_secret';
     private static $webhook_replay_prefix = 'wooms_webhook_replay_';
@@ -46,6 +47,7 @@ class OrderUpdateFromMoySklad
         });
 
         add_action('rest_api_init', array(__CLASS__, 'add_route'));
+        add_action(self::$hook_process_webhook, array(__CLASS__, 'process_order_webhook'), 10, 4);
 
         add_action('init', array(__CLASS__, 'add_schedule_hook'));
 
@@ -998,13 +1000,6 @@ class OrderUpdateFromMoySklad
                 return new \WP_REST_Response(null, 204);
             }
 
-            self::set_state('is_wait', 0);
-
-            $data_order = request($order_path);
-            if (empty($data_order['id'])) {
-                self::release_webhook_request($data_request);
-                return new \WP_REST_Response(array('error' => 'MoySklad order request failed'), 502);
-            }
             $order_id = $orders[0]->ID;
 
             //Если стоит блокировка обновления Заказа, то выходим (защита от состояния гонки)
@@ -1014,31 +1009,136 @@ class OrderUpdateFromMoySklad
                 return new \WP_REST_Response(array('success' => 'Order update is already locked'), 200);
             }
 
-            update_post_meta($order_id, self::$hook_order_update_from_moysklad, 1);
+            $action_id = 0;
+            $queue_error = 'Action Scheduler did not return a persisted action ID';
+            try {
+                $action_id = as_enqueue_async_action(
+                    self::$hook_process_webhook,
+                    array('order_id' => $order_id, 'order_uuid' => $order_uuid, 'request_id' => $request_id),
+                    'WooMS'
+                );
+            } catch (\Throwable $exception) {
+                $queue_error = $exception->getMessage();
+            }
 
+            if (!is_int($action_id) || $action_id <= 0) {
+                self::release_webhook_request($data_request);
+                do_action(
+                    'wooms_logger_error',
+                    __CLASS__,
+                    sprintf('Веб-хук %s не поставлен в фоновую очередь', $request_id),
+                    array('phase' => 'enqueue', 'request_id' => $request_id, 'order_id' => $order_id, 'order_uuid' => $order_uuid, 'error' => $queue_error)
+                );
+                return new \WP_REST_Response(array('error' => 'Webhook could not be queued'), 503);
+            }
+
+            self::mark_webhook_processed($data_request);
             do_action(
                 'wooms_logger',
                 __CLASS__,
-                sprintf('Заказ %s поставлен в очередь на обновление из МойСклад', $order_id)
+                sprintf('Веб-хук %s принят в фоновую очередь: задача %d, заказ %d', $request_id, $action_id, $order_id)
             );
-
-            do_action('wooms_order_update_from_moysklad_action', $order_id, $data_order, $order_uuid);
-
-            $result     = true;
-            if ($result) {
-                self::mark_webhook_processed($data_request);
-                $response = new \WP_REST_Response(array('success', 'Data received successfully'));
-                $response->set_status(200);
-                return $response;
-            } else {
-                throw new \Exception("Заказ не обновился");
-            }
+            return new \WP_REST_Response(null, 204);
         } catch (Exception $e) {
             self::release_webhook_request($data_request);
             $response = new \WP_REST_Response(array('fail', $e->getMessage()));
             $response->set_status(500);
             return $response;
         }
+    }
+
+    /**
+     * Process a queued webhook and persist a bounded retry when the attempt fails.
+     *
+     * @internal
+     * @param int $order_id Local order ID.
+     * @param string $order_uuid Validated MoySklad order UUID.
+     * @param string $request_id Provider notification ID.
+     * @param int $attempt Zero for the initial attempt, otherwise the persisted retry number.
+     * @return void
+     */
+    public static function process_order_webhook($order_id, $order_uuid, $request_id, $attempt = 0)
+    {
+        try {
+            self::prepare_webhook_order_update($order_id, $order_uuid, $request_id);
+        } catch (\Throwable $exception) {
+            $retry = OrderWebhookRetries::schedule_retry($order_id, $order_uuid, $request_id, $attempt);
+            $context = array(
+                'phase' => 'processing',
+                'request_id' => $request_id,
+                'order_id' => $order_id,
+                'order_uuid' => $order_uuid,
+                'attempt' => $attempt,
+                'error' => $exception->getMessage(),
+            );
+            if (is_wp_error($retry)) {
+                $context['retry_error_code'] = $retry->get_error_code();
+                $context['retry_error'] = $retry->get_error_message();
+                $message = 'wooms_webhook_retries_exhausted' === $retry->get_error_code()
+                    ? sprintf('Веб-хук %s: попытки обработки исчерпаны', $request_id)
+                    : sprintf('Веб-хук %s: не удалось назначить повтор (%s)', $request_id, $retry->get_error_message());
+            } else {
+                $context['retry_action_id'] = $retry;
+                $context['next_attempt'] = $attempt + 1;
+                $message = sprintf('Веб-хук %s: ошибка попытки %d, назначен повтор %d (задача %d)', $request_id, $attempt + 1, $attempt + 1, $retry);
+            }
+            do_action('wooms_logger_error', __CLASS__, $message, $context);
+
+            // Retain the failed source action in Action Scheduler, including the retry decision.
+            throw new \RuntimeException($message . ': ' . $exception->getMessage(), 0, $exception);
+        }
+    }
+
+    /**
+     * Fetch webhook order data and hand off to the existing order synchronization queue.
+     */
+    private static function prepare_webhook_order_update($order_id, $order_uuid, $request_id)
+    {
+        if (!self::is_enable()) {
+            throw new \RuntimeException('Webhook processing is disabled');
+        }
+
+        if (!self::can_process_webhook_order($order_id, $order_uuid)) {
+            return;
+        }
+
+        $data_order = request('entity/customerorder/' . $order_uuid);
+        if (empty($data_order['id']) || strtolower((string) $data_order['id']) !== $order_uuid) {
+            throw new \RuntimeException('MoySklad order request failed for webhook ' . $request_id);
+        }
+
+        // The order may have been deleted or relinked while the provider request was running.
+        if (!self::can_process_webhook_order($order_id, $order_uuid)) {
+            return;
+        }
+
+        update_post_meta($order_id, self::$hook_order_update_from_moysklad, 1);
+        if (!get_post_meta($order_id, self::$hook_order_update_from_moysklad, true)) {
+            throw new \RuntimeException('Order could not be queued for webhook ' . $request_id);
+        }
+        self::set_state('is_wait', 0);
+
+        do_action(
+            'wooms_logger',
+            __CLASS__,
+            sprintf('Заказ %s поставлен в очередь на обновление из МойСклад (веб-хук %s)', $order_id, $request_id)
+        );
+        do_action('wooms_order_update_from_moysklad_action', $order_id, $data_order, $order_uuid);
+    }
+
+    /**
+     * Check that the queued order still belongs to this webhook and consume callback locks.
+     */
+    private static function can_process_webhook_order($order_id, $order_uuid)
+    {
+        if (strtolower((string) get_post_meta($order_id, 'wooms_id', true)) !== $order_uuid) {
+            return false;
+        }
+        if (get_post_meta($order_id, 'lock_callback_update', true)) {
+            delete_post_meta($order_id, 'lock_callback_update');
+            return false;
+        }
+        return true;
     }
 
     /**

@@ -207,7 +207,7 @@ it('rejects an unauthenticated retry before any provider request', function (): 
     }
 });
 
-it('processes an authenticated webhook once and acknowledges completed retries', function (): void {
+it('enqueues an authenticated webhook once and acknowledges accepted retries', function (): void {
     $missing = new stdClass();
     $original_webhook_option = get_option('wooms_enable_webhooks', $missing);
     $original_secret = get_option('wooms_webhook_secret', $missing);
@@ -217,6 +217,14 @@ it('processes an authenticated webhook once and acknowledges completed retries',
     $api_calls = 0;
     $sync_calls = 0;
     $order_id = 0;
+    $queued_actions = array();
+    $queue_filter = static function ($preempt, $hook, $args, $group) use (&$queued_actions) {
+        if ('wooms_process_order_webhook' !== $hook) {
+            return $preempt;
+        }
+        $queued_actions[] = array('hook' => $hook, 'args' => $args, 'group' => $group);
+        return 123;
+    };
     $http_filter = static function ($preempt, $args, $url) use (&$api_calls, $order_uuid) {
         $api_calls++;
 
@@ -245,6 +253,7 @@ it('processes an authenticated webhook once and acknowledges completed retries',
     delete_post_meta($order_id, 'lock_callback_update');
 
     add_filter('pre_http_request', $http_filter, 10, 3);
+    add_filter('pre_as_enqueue_async_action', $queue_filter, 10, 4);
     add_action('wooms_order_update_from_moysklad_action', $sync_action, 10, 3);
 
     $request = new WP_REST_Request('POST', '/wooms/v1/order-update/');
@@ -275,14 +284,21 @@ it('processes an authenticated webhook once and acknowledges completed retries',
         $replay_response = OrderUpdateFromMoySklad::get_data_order_from_moysklad($request);
 
         expect($response)->toBeInstanceOf(WP_REST_Response::class);
-        expect($response->get_status())->toBe(200);
+        expect($response->get_status())->toBe(204);
+        expect($response->get_data())->toBeNull();
         expect($replay_response)->toBeInstanceOf(WP_REST_Response::class);
         expect($replay_response->get_status())->toBe(204);
         expect($replay_response->get_data())->toBeNull();
-        expect($api_calls)->toBe(1);
-        expect($sync_calls)->toBe(1);
+        expect($api_calls)->toBe(0);
+        expect($sync_calls)->toBe(0);
+        expect($queued_actions)->toBe(array(array(
+            'hook' => 'wooms_process_order_webhook',
+            'args' => array('order_id' => $order_id, 'order_uuid' => $order_uuid, 'request_id' => $request_id),
+            'group' => 'WooMS',
+        )));
     } finally {
         remove_filter('pre_http_request', $http_filter, 10);
+        remove_filter('pre_as_enqueue_async_action', $queue_filter, 10);
         remove_action('wooms_order_update_from_moysklad_action', $sync_action, 10);
         delete_transient('wooms_webhook_replay_' . hash('sha256', $request_id));
         delete_transient('wooms_webhook_rate_' . gmdate('YmdHi'));
@@ -408,7 +424,7 @@ it('acknowledges unlinked orders and their retries without a provider request', 
     }
 });
 
-it('preserves existing linked order handling', function (string $scenario): void {
+it('defers linked order provider work until the queued action runs', function (string $scenario): void {
     $missing = new stdClass();
     $original_options = array();
     foreach (array('wooms_enable_webhooks', 'wooms_webhook_secret', OrderUpdateFromMoySklad::$state_key) as $option) {
@@ -424,11 +440,56 @@ it('preserves existing linked order handling', function (string $scenario): void
     $sync_calls = 0;
     $sync_payload = array();
     $provider_data = array('id' => $order_uuid, 'name' => 'Contract test order');
-    $provider_fails = 'provider error' === $scenario;
-    $http_filter = static function ($preempt, $args, $url) use (&$api_calls, &$provider_fails, $provider_data) {
+    $provider_fails = in_array($scenario, array('provider error', 'retry exhausted', 'retry queue error', 'retry queue exception'), true);
+    $order_id = 0;
+    $queue_fails = in_array($scenario, array('queue error', 'queue negative id'), true);
+    $queue_throws = 'queue exception' === $scenario;
+    $queued_actions = array();
+    $scheduled_retries = array();
+    $error_logs = array();
+    $retry_queue_fails = 'retry queue error' === $scenario;
+    $retry_queue_throws = 'retry queue exception' === $scenario;
+    $retry_filter = static function ($preempt, $timestamp, $hook, $args, $group) use (&$scheduled_retries, &$retry_queue_fails, &$retry_queue_throws) {
+        if ('wooms_process_order_webhook' !== $hook) {
+            return $preempt;
+        }
+        if ($retry_queue_throws) {
+            throw new RuntimeException('Test retry store is unavailable');
+        }
+        if ($retry_queue_fails) {
+            return 0;
+        }
+        $scheduled_retries[] = compact('timestamp', 'hook', 'args', 'group');
+        return 700 + count($scheduled_retries);
+    };
+    $error_logger = static function ($source, $title, $context = array()) use (&$error_logs): void {
+        if (OrderUpdateFromMoySklad::class === $source) {
+            $error_logs[] = compact('title', 'context');
+        }
+    };
+    $queue_filter = static function ($preempt, $hook, $args) use (&$queued_actions, &$queue_fails, &$queue_throws, $scenario) {
+        if ('wooms_process_order_webhook' !== $hook) {
+            return $preempt;
+        }
+        if ($queue_throws) {
+            throw new RuntimeException('Test action store is unavailable');
+        }
+        if ($queue_fails) {
+            return 'queue negative id' === $scenario ? -1 : 0;
+        }
+        $queued_actions[] = $args;
+        return 456;
+    };
+    $http_filter = static function ($preempt, $args, $url) use (&$api_calls, &$provider_fails, $provider_data, &$order_id, $scenario) {
         $api_calls++;
         if ($provider_fails) {
             return new WP_Error('test_provider_unavailable', 'Provider is temporarily unavailable');
+        }
+        if ('mapping changes during request' === $scenario) {
+            update_post_meta($order_id, 'wooms_id', wp_generate_uuid4());
+        }
+        if ('lock appears during request' === $scenario) {
+            update_post_meta($order_id, 'lock_callback_update', 1);
         }
         return array(
             'headers' => array(),
@@ -458,7 +519,10 @@ it('preserves existing linked order handling', function (string $scenario): void
         update_post_meta($order_id, 'lock_callback_update', 1);
     }
     add_filter('pre_http_request', $http_filter, 10, 3);
+    add_filter('pre_as_enqueue_async_action', $queue_filter, 10, 3);
+    add_filter('pre_as_schedule_single_action', $retry_filter, 10, 5);
     add_action('wooms_order_update_from_moysklad_action', $sync_action, 10, 3);
+    add_action('wooms_logger_error', $error_logger, 10, 3);
 
     $request = new WP_REST_Request('POST', '/wooms/v1/order-update/');
     $request->set_query_params(array('key' => $secret, 'requestId' => $request_id));
@@ -477,33 +541,116 @@ it('preserves existing linked order handling', function (string $scenario): void
         expect(OrderUpdateFromMoySklad::authorize_webhook($request))->toBeTrue();
         $response = OrderUpdateFromMoySklad::get_data_order_from_moysklad($request);
 
-        if ($provider_fails) {
-            expect($response->get_status())->toBe(502);
-            expect(get_transient($replay_key))->toBeFalse();
-            expect(get_post_meta($order_id, OrderUpdateFromMoySklad::$hook_order_update_from_moysklad, true))->toBe('');
-            expect($sync_calls)->toBe(0);
+        expect($api_calls)->toBe(0);
+        expect($sync_calls)->toBe(0);
+        expect(get_post_meta($order_id, OrderUpdateFromMoySklad::$hook_order_update_from_moysklad, true))->toBe('');
+        expect(OrderUpdateFromMoySklad::get_state('is_wait'))->toBe(1);
 
-            $provider_fails = false;
+        if ($queue_fails || $queue_throws) {
+            expect($response->get_status())->toBe(503);
+            expect(get_transient($replay_key))->toBeFalse();
+            expect($queued_actions)->toBe(array());
+            $queue_log = end($error_logs);
+            expect($queue_log['context']['request_id'] ?? null)->toBe($request_id);
+            expect($queue_log['context']['phase'] ?? null)->toBe('enqueue');
+            $queue_fails = $queue_throws = false;
             expect(OrderUpdateFromMoySklad::authorize_webhook($request))->toBeTrue();
             $response = OrderUpdateFromMoySklad::get_data_order_from_moysklad($request);
         }
 
-        expect($response->get_status())->toBe(200);
         expect(get_transient($replay_key))->toBe('processed');
         expect(get_post_meta($order_id, 'lock_callback_update', true))->toBe('');
-        expect($api_calls)->toBe('provider error' === $scenario ? 2 : 1);
 
         if ('locked order' === $scenario) {
-            expect(get_post_meta($order_id, OrderUpdateFromMoySklad::$hook_order_update_from_moysklad, true))->toBe('');
+            expect($response->get_status())->toBe(200);
+            expect($queued_actions)->toBe(array());
+            expect($api_calls)->toBe(0);
             expect($sync_calls)->toBe(0);
         } else {
-            expect((int) get_post_meta($order_id, OrderUpdateFromMoySklad::$hook_order_update_from_moysklad, true))->toBe(1);
-            expect($sync_calls)->toBe(1);
-            expect($sync_payload)->toBe(array($order_id, $provider_data, $order_uuid));
+            expect($response->get_status())->toBe(204);
+            expect(count($queued_actions))->toBe(1);
+            $job_args = array_values($queued_actions[0]);
+            if ('mapping changes before execution' === $scenario) {
+                update_post_meta($order_id, 'wooms_id', wp_generate_uuid4());
+            }
+            if ('lock appears before execution' === $scenario) {
+                update_post_meta($order_id, 'lock_callback_update', 1);
+            }
+            if ($provider_fails) {
+                $failure = null;
+                try {
+                    do_action('wooms_process_order_webhook', ...$job_args);
+                } catch (RuntimeException $exception) {
+                    $failure = $exception;
+                }
+                expect($failure)->toBeInstanceOf(RuntimeException::class);
+                expect($sync_calls)->toBe(0);
+                expect(get_post_meta($order_id, OrderUpdateFromMoySklad::$hook_order_update_from_moysklad, true))->toBe('');
+                expect(get_transient($replay_key))->toBe('processed');
+
+                $failure_log = end($error_logs);
+                expect($failure_log['context']['request_id'] ?? null)->toBe($request_id);
+                expect($failure_log['context']['order_id'] ?? null)->toBe($order_id);
+                expect($failure_log['context']['order_uuid'] ?? null)->toBe($order_uuid);
+                expect($failure_log['context']['attempt'] ?? null)->toBe(0);
+                expect(strpos($failure->getMessage(), $request_id) !== false)->toBeTrue();
+
+                if ($retry_queue_fails || $retry_queue_throws) {
+                    expect($scheduled_retries)->toBe(array());
+                    expect($failure_log['context']['retry_error_code'] ?? null)->toBe('wooms_webhook_retry_queue_failed');
+                    expect($api_calls)->toBe(1);
+                    return;
+                }
+
+                expect(count($scheduled_retries))->toBe(1);
+                expect($scheduled_retries[0]['args']['attempt'])->toBe(1);
+                expect($failure_log['context']['retry_action_id'] ?? null)->toBe(701);
+
+                if ('retry exhausted' === $scenario) {
+                    for ($attempt = 1; $attempt <= 3; $attempt++) {
+                        expect($scheduled_retries[$attempt - 1]['args']['attempt'])->toBe($attempt);
+                        $failure = null;
+                        try {
+                            do_action('wooms_process_order_webhook', ...array_values($scheduled_retries[$attempt - 1]['args']));
+                        } catch (RuntimeException $exception) {
+                            $failure = $exception;
+                        }
+                        expect($failure)->toBeInstanceOf(RuntimeException::class);
+                    }
+                    $final_log = end($error_logs);
+                    expect($api_calls)->toBe(4);
+                    expect(count($scheduled_retries))->toBe(3);
+                    expect(count($error_logs))->toBe(4);
+                    expect($final_log['context']['attempt'] ?? null)->toBe(3);
+                    expect($final_log['context']['retry_error_code'] ?? null)->toBe('wooms_webhook_retries_exhausted');
+                    expect($sync_calls)->toBe(0);
+                    expect(get_post_meta($order_id, OrderUpdateFromMoySklad::$hook_order_update_from_moysklad, true))->toBe('');
+                    return;
+                }
+
+                $job_args = array_values($scheduled_retries[0]['args']);
+                $provider_fails = false;
+            }
+            do_action('wooms_process_order_webhook', ...$job_args);
+            $skipped_before_request = in_array($scenario, array('mapping changes before execution', 'lock appears before execution'), true);
+            $skipped_after_request = in_array($scenario, array('mapping changes during request', 'lock appears during request'), true);
+            expect($api_calls)->toBe($skipped_before_request ? 0 : ('provider error' === $scenario ? 2 : 1));
+            if ($skipped_before_request || $skipped_after_request) {
+                expect(get_post_meta($order_id, OrderUpdateFromMoySklad::$hook_order_update_from_moysklad, true))->toBe('');
+                expect($sync_calls)->toBe(0);
+                expect(get_post_meta($order_id, 'lock_callback_update', true))->toBe('');
+            } else {
+                expect((int) get_post_meta($order_id, OrderUpdateFromMoySklad::$hook_order_update_from_moysklad, true))->toBe(1);
+                expect($sync_calls)->toBe(1);
+                expect($sync_payload)->toBe(array($order_id, $provider_data, $order_uuid));
+            }
         }
     } finally {
         remove_filter('pre_http_request', $http_filter, 10);
+        remove_filter('pre_as_enqueue_async_action', $queue_filter, 10);
+        remove_filter('pre_as_schedule_single_action', $retry_filter, 10);
         remove_action('wooms_order_update_from_moysklad_action', $sync_action, 10);
+        remove_action('wooms_logger_error', $error_logger, 10);
         wp_delete_post($order_id, true);
         delete_transient($replay_key);
         if (false === $original_rate) {
@@ -519,4 +666,18 @@ it('preserves existing linked order handling', function (string $scenario): void
             }
         }
     }
-})->with(array('normal order', 'locked order', 'provider error'));
+})->with(array(
+    'normal order',
+    'locked order',
+    'provider error',
+    'retry exhausted',
+    'retry queue error',
+    'retry queue exception',
+    'queue error',
+    'queue negative id',
+    'queue exception',
+    'mapping changes before execution',
+    'mapping changes during request',
+    'lock appears before execution',
+    'lock appears during request',
+));
