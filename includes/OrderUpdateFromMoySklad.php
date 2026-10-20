@@ -23,12 +23,15 @@ class OrderUpdateFromMoySklad
     private static $webhook_rate_prefix = 'wooms_webhook_rate_';
     // Leave room below the Action Scheduler DB store's 8000-byte JSON args limit.
     private const WEBHOOK_BATCH_ARGS_BUDGET = 7000;
+    private static $webhook_started_at;
+    private const WEBHOOK_RESPONSE_LIMIT_MS = 1500;
 
     /**
      * The init
      */
     public static function init()
     {
+        self::$webhook_started_at = microtime(true);
         // add_action('init', function () {
         //     if (!isset($_GET['dd'])) {
         //         return;
@@ -42,6 +45,7 @@ class OrderUpdateFromMoySklad
         add_action(self::$hook_order_update_from_moysklad, array(__CLASS__, 'process_order_update'));
 
         add_action('rest_api_init', array(__CLASS__, 'add_route'));
+        add_filter('rest_post_dispatch', array(__CLASS__, 'log_webhook_response'), PHP_INT_MAX, 3);
         add_action(self::$hook_process_webhook, array(__CLASS__, 'process_order_webhook'), 10, 4);
         add_action(self::$hook_dispatch_webhook_batch, array(__CLASS__, 'dispatch_order_webhook_batch'), 10, 3);
 
@@ -954,6 +958,60 @@ class OrderUpdateFromMoySklad
             'callback' => array(__CLASS__, 'get_data_order_from_moysklad'),
             'permission_callback' => array(__CLASS__, 'authorize_webhook'),
         ));
+    }
+
+    /**
+     * Record the prepared REST response, including permission and validation failures.
+     * PHP time includes bootstrap where REQUEST_TIME_FLOAT is available; it does
+     * not measure proxy/network latency or prove delivery within the provider deadline.
+     * Logging must not replace an already prepared response.
+     */
+    public static function log_webhook_response($response, $server, $request)
+    {
+        if ('/wooms/v1/order-update' !== rtrim($request->get_route(), '/')) {
+            return $response;
+        }
+        $php_start = $_SERVER['REQUEST_TIME_FLOAT'] ?? null;
+        $has_php_start = is_numeric($php_start) && is_finite((float) $php_start) && $php_start > 0;
+        $started = $has_php_start ? (float) $php_start : self::$webhook_started_at;
+        $elapsed = round(max(0, (microtime(true) - $started) * 1000), 2);
+        $status = $response->get_status();
+        $success = in_array($status, array(200, 204), true);
+        $events_count = null;
+        $body = (string) $request->get_body();
+        if (strlen($body) <= 65536) {
+            $data = json_decode($body, true);
+            $events_count = is_array($data['events'] ?? null) ? count($data['events']) : null;
+        }
+        $request_id = self::get_webhook_request_id($request);
+        $context = array(
+            'phase' => 'http_response',
+            'request_id' => false === $request_id ? null : $request_id,
+            'http_status' => $status,
+            'php_duration_ms' => $elapsed,
+            'timing_source' => $has_php_start ? 'php_request_start' : 'plugin_start',
+            'timing_boundary' => 'prepared_rest_response',
+            'events_count' => $events_count,
+            'provider_acceptable_status' => $success,
+            'slow' => $elapsed >= self::WEBHOOK_RESPONSE_LIMIT_MS,
+        );
+        try {
+            do_action(
+                $success && !$context['slow'] ? 'wooms_logger' : 'wooms_logger_error',
+                __CLASS__,
+                sprintf('Подготовлен ответ на веб-хук МойСклад: HTTP %d, PHP %.2f мс', $status, $elapsed),
+                $context
+            );
+        } catch (\Throwable $exception) {
+            // The logging extension failed; retain safe diagnostics in PHP's log and keep the response.
+            try {
+                error_log('WooMS: webhook response logging failed: ' . wp_json_encode($context));
+            } catch (\Throwable $logging_error) {
+                // Both logging channels failed; diagnostics must not replace the business response.
+                return $response;
+            }
+        }
+        return $response;
     }
 
     /**
