@@ -198,7 +198,7 @@ it('accepts all batch orders through one durable dispatcher', function (string $
         expect(array_column(array_column($jobs, 'args'), 'order_uuid'))->toBe($batch['uuids']);
     }
     if ('locked child' === $scenario) {
-        expect(get_post_meta($batch['post_ids'][1], 'lock_callback_update', true))->toBe(1);
+        expect(get_post_meta($batch['post_ids'][1], 'lock_callback_update', true))->toBe('1');
         do_action($jobs[1]['hook'], ...array_values($jobs[1]['args']));
         expect(get_post_meta($batch['post_ids'][1], 'lock_callback_update', true))->toBe('');
     }
