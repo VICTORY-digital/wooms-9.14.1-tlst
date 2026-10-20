@@ -39,13 +39,7 @@ class OrderUpdateFromMoySklad
         //     die("ddd");
         // });
 
-        add_action('wooms_order_update_from_moysklad', function ($args) {
-            if (empty($args['post_id'])) {
-                return;
-            }
-            self::update_order_from_moysklad($args['post_id']);
-            delete_post_meta($args['post_id'], self::$hook_order_update_from_moysklad);
-        });
+        add_action(self::$hook_order_update_from_moysklad, array(__CLASS__, 'process_order_update'));
 
         add_action('rest_api_init', array(__CLASS__, 'add_route'));
         add_action(self::$hook_process_webhook, array(__CLASS__, 'process_order_webhook'), 10, 4);
@@ -58,8 +52,8 @@ class OrderUpdateFromMoySklad
 
         add_action('admin_init', array(__CLASS__, 'add_settings'), 100);
 
-        add_filter('wooms_update_order_from_moysklad', array(__CLASS__, 'update_order_status'), 11, 2);
-        add_filter('wooms_update_order_from_moysklad', array(__CLASS__, 'update_order_items'), 15, 2);
+        add_filter('wooms_update_order_from_moysklad', array(__CLASS__, 'update_order_status'), 11, 3);
+        add_filter('wooms_update_order_from_moysklad', array(__CLASS__, 'update_order_items'), 15, 3);
 
         add_filter('wooms_skip_order_update', array(__CLASS__, 'skip_order_update_from_site'), 10, 2);
 
@@ -71,7 +65,8 @@ class OrderUpdateFromMoySklad
     {
 
         //если стоит задача на апдейт из МойСклад, то пропускаем
-        if (get_post_meta($order_id, self::$hook_order_update_from_moysklad, true)) {
+        $marker = get_post_meta($order_id, self::$hook_order_update_from_moysklad, true);
+        if ($marker && (!is_array($marker) || 'failed' !== ($marker['status'] ?? ''))) {
             return;
         }
 
@@ -88,19 +83,17 @@ class OrderUpdateFromMoySklad
      *
      * @return \WC_Order - order object
      */
-    public static function update_order_status($order, $data_api)
+    public static function update_order_status($order, $data_api, $snapshot = null)
     {
         if (!self::is_enable()) {
             return $order;
         }
 
-        $state_url  = $data_api["state"]["meta"]["href"];
-        $state_data = request($state_url);
-        if (empty($state_data['name'])) {
+        $state_name = is_array($snapshot) && array_key_exists('state_name', $snapshot)
+            ? $snapshot['state_name'] : self::fetch_order_status($data_api);
+        if (null === $state_name) {
             return $order;
         }
-
-        $state_name = $state_data['name'];
 
         $statuses_match_default = array(
             'wc-pending' => 'Новый',
@@ -131,37 +124,18 @@ class OrderUpdateFromMoySklad
      *
      * @return \WC_Order - order object
      */
-    public static function update_order_items($order, $data_api)
+    public static function update_order_items($order, $data_api, $snapshot = null)
     {
-
-        if (empty($data_api['positions']['meta']['href'])) {
+        $items = is_array($snapshot) && array_key_exists('items', $snapshot)
+            ? $snapshot['items'] : self::fetch_order_items($data_api);
+        if (null === $items) {
             return $order;
         }
-
-        $url_api = $data_api['positions']['meta']['href'];
-
-        $data = request($url_api);
-
-
-        $shipment_product_href = self::get_shipment_product_href();
-
-        // remove shipment if exist from data api
-        foreach ($data['rows'] as $key => $row) {
-            if ($shipment_product_href == $row['assortment']['meta']['href']) {
-                unset($data['rows'][$key]);
-            }
-        }
-
         $data_api_wooms_id_array = [];
-
-        foreach ($data['rows'] as $row) {
-
-            $product_href = $row['assortment']['meta']['href'];
-            $product_uuid = wooms_get_wooms_id_from_href($product_href);
+        foreach ($items as $item) {
+            $row = $item['row'];
+            $product_uuid = $item['uuid'];
             $data_api_wooms_id_array[] = $product_uuid;
-            $product_id = wooms_get_product_id_by_uuid($product_uuid);
-
-            $product = wc_get_product($product_id);
 
             if ($item_id = self::get_order_item_id_by_wooms_id($product_uuid, $order)) {
                 $line_item = new \WC_Order_Item_Product($item_id);
@@ -169,13 +143,13 @@ class OrderUpdateFromMoySklad
                 $line_item = new \WC_Order_Item_Product();
             }
 
-            $line_item->set_product($product);
+            $line_item->set_product($item['product']);
             $line_item->set_order_id($order->get_id());
             $line_item->set_quantity($row['quantity']);
 
             $total = floatval($row['quantity'] * $row['price'] / 100);
 
-            $discount = $row['discount'];
+            $discount = $row['discount'] ?? 0;
 
             if (empty($discount)) {
                 $line_item->set_total($total);
@@ -203,7 +177,9 @@ class OrderUpdateFromMoySklad
             //     $line_item->set_total_tax($tax_total);
             // }
 
-            $item_id = $line_item->save();
+            if (!$line_item->save()) {
+                throw new \RuntimeException('Could not save an updated order line');
+            }
 
             // $items = $order->get_items();
         }
@@ -225,6 +201,100 @@ class OrderUpdateFromMoySklad
         // $order->save();
 
         return $order;
+    }
+
+    /** Fetch all provider inputs before filters can persist any order changes. */
+    private static function fetch_order_status(array $data)
+    {
+        if (!self::is_enable() || !isset($data['state'])) {
+            return null;
+        }
+        $href = $data['state']['meta']['href'] ?? null;
+        if (!is_string($href) || false === MoySkladApiUrl::normalize($href)) {
+            throw new \RuntimeException('Invalid MoySklad order state address');
+        }
+        $state = request($href);
+        if (!is_array($state) || !empty($state['errors']) || !is_string($state['name'] ?? null) || '' === $state['name']) {
+            throw new \RuntimeException('MoySklad order state request failed');
+        }
+        return $state['name'];
+    }
+
+    /** Resolve and validate every position and local product before the first line write. */
+    private static function fetch_order_items(array $data)
+    {
+        if (!isset($data['positions'])) {
+            return null;
+        }
+        $href = $data['positions']['meta']['href'] ?? null;
+        if (!is_string($href) || false === MoySkladApiUrl::normalize($href)) {
+            throw new \RuntimeException('Invalid MoySklad order positions address');
+        }
+        $rows = array();
+        $seen = array();
+        $size = null;
+        $path = wp_parse_url(MoySkladApiUrl::normalize($href), PHP_URL_PATH);
+        while ($href) {
+            $url = MoySkladApiUrl::normalize($href);
+            if (false === $url || isset($seen[$url]) || wp_parse_url($url, PHP_URL_PATH) !== $path) {
+                throw new \RuntimeException('Invalid MoySklad positions pagination');
+            }
+            $seen[$url] = true;
+            $page = request($url);
+            if (!is_array($page) || !empty($page['errors']) || !is_array($page['rows'] ?? null)
+                || ($page['rows'] && array_keys($page['rows']) !== range(0, count($page['rows']) - 1))) {
+                throw new \RuntimeException('MoySklad order positions request failed');
+            }
+            if (isset($page['meta']['size'])) {
+                if (!is_numeric($page['meta']['size']) || (float) $page['meta']['size'] !== (float) (int) $page['meta']['size']
+                    || $page['meta']['size'] < 0 || ($size !== null && $size !== (int) $page['meta']['size'])) {
+                    throw new \RuntimeException('MoySklad positions changed during pagination');
+                }
+                $size = (int) $page['meta']['size'];
+            }
+            if (isset($page['meta']['offset']) && (int) $page['meta']['offset'] !== count($rows)) {
+                throw new \RuntimeException('Incomplete MoySklad order positions');
+            }
+            $rows = array_merge($rows, $page['rows']);
+            $href = $page['meta']['nextHref'] ?? '';
+            if (($size !== null && count($rows) > $size) || ($href && (!is_string($href) || !$page['rows'] || $size === null || count($rows) >= $size))) {
+                throw new \RuntimeException('Invalid MoySklad positions pagination');
+            }
+        }
+        if ($size !== null && $size !== count($rows)) {
+            throw new \RuntimeException('Incomplete MoySklad order positions');
+        }
+        $shipment = self::get_shipment_product_href();
+        if (get_option('wooms_order_shipment_item_code') && !$shipment) {
+            throw new \RuntimeException('MoySklad shipment service request failed');
+        }
+        $shipment = $shipment ? MoySkladApiUrl::normalize($shipment) : false;
+        $items = array();
+        foreach ($rows as $row) {
+            $href = $row['assortment']['meta']['href'] ?? null;
+            $url = MoySkladApiUrl::normalize($href);
+            if (false === $url) {
+                throw new \RuntimeException('Invalid MoySklad order assortment address');
+            }
+            if ($shipment && $url === $shipment) {
+                continue;
+            }
+            foreach (array('quantity', 'price') as $field) {
+                if (!is_numeric($row[$field] ?? null) || !is_finite((float) $row[$field])) {
+                    throw new \RuntimeException('Invalid MoySklad order position ' . $field);
+                }
+            }
+            if (isset($row['discount']) && (!is_numeric($row['discount']) || !is_finite((float) $row['discount']))) {
+                throw new \RuntimeException('Invalid MoySklad order position discount');
+            }
+            $uuid = basename(wp_parse_url($url, PHP_URL_PATH));
+            $product = wc_get_product(wooms_get_product_id_by_uuid($uuid));
+            if (!$product instanceof \WC_Product) {
+                throw new \RuntimeException('MoySklad order position is not linked to a local product: ' . $uuid);
+            }
+            $items[] = array('uuid' => $uuid, 'row' => $row, 'product' => $product);
+        }
+        return $items;
     }
 
     /**
@@ -295,7 +365,7 @@ class OrderUpdateFromMoySklad
 
         $task_exist = $order->get_meta(self::$hook_order_update_from_moysklad, true);
 
-        if ($task_exist) {
+        if ($task_exist && (!is_array($task_exist) || 'failed' !== ($task_exist['status'] ?? ''))) {
             return true;
         }
 
@@ -348,36 +418,128 @@ class OrderUpdateFromMoySklad
             'update_post_term_cache' => false,
             'update_post_meta_cache' => false,
             'cache_results'          => false,
+            'numberposts'            => -1,
+            'fields'                 => 'ids',
+            'orderby'                => 'ID',
+            'order'                  => 'ASC',
         ];
 
-        $posts = get_posts($args);
+        $order_ids = get_posts($args);
 
 
-        if (empty($posts)) {
-            self::set_state('is_wait', 1);
+        $has_pending = false;
+        foreach (array_chunk($order_ids, 100) as $chunk) {
+            update_meta_cache('post', $chunk);
+            foreach ($chunk as $order_id) {
+                $context = self::get_order_update_context($order_id, true);
+                if (!$context || 'pending' !== $context['status']) {
+                    continue;
+                }
+                $has_pending = true;
+                try {
+                    self::enqueue_webhook_action(self::$hook_order_update_from_moysklad, self::get_order_update_action_args($order_id, $context));
+                } catch (\Throwable $exception) {
+                    do_action('wooms_logger_error', __CLASS__, 'Не удалось сохранить задачу обновления заказа МойСклад', array(
+                        'phase' => 'final_enqueue', 'order_id' => $order_id, 'request_id' => $context['request_id'],
+                        'generation' => $context['generation'], 'error' => $exception->getMessage(),
+                    ));
+                }
+            }
+        }
+        self::set_state('is_wait', $has_pending ? 0 : 1);
+    }
+
+    /** Adopt pre-upgrade scalar markers once, preserving newer notification generations. */
+    private static function get_order_update_context($order_id, $adopt_legacy = false)
+    {
+        $marker = get_post_meta($order_id, self::$hook_order_update_from_moysklad, true);
+        if ($adopt_legacy && $marker && !is_array($marker)) {
+            $uuid = strtolower((string) get_post_meta($order_id, 'wooms_id', true));
+            if (!$uuid) {
+                delete_post_meta($order_id, self::$hook_order_update_from_moysklad, $marker);
+                return false;
+            }
+            $context = array('request_id' => 'legacy-' . wp_generate_uuid4(), 'order_uuid' => $uuid,
+                'generation' => wp_generate_uuid4(), 'status' => 'pending');
+            update_post_meta($order_id, self::$hook_order_update_from_moysklad, $context, $marker);
+            $marker = get_post_meta($order_id, self::$hook_order_update_from_moysklad, true);
+        }
+        if (!is_array($marker) || empty($marker['request_id']) || empty($marker['order_uuid']) || empty($marker['generation'])
+            || !in_array($marker['status'] ?? '', array('pending', 'failed'), true)) {
+            return false;
+        }
+        return $marker;
+    }
+
+    private static function get_order_update_action_args($order_id, array $context)
+    {
+        return array('data' => array('post_id' => $order_id, 'request_id' => $context['request_id'],
+            'order_uuid' => $context['order_uuid'], 'generation' => $context['generation'], 'attempt' => 0));
+    }
+
+    /** The legacy AS hook receives one nested data argument, including its persisted attempt. */
+    public static function process_order_update($args)
+    {
+        if (!is_array($args) || empty($args['post_id'])) {
             return;
         }
-
-        foreach ($posts as $post) {
-
-            $args = [
-                'data' => [
-                    'post_id' => $post->ID,
-                    'time' => time(),
-                ]
-            ];
-
-            // as_enqueue_async_action( self::$hook_order_update_from_moysklad, $args, 'WooMS' );
-            as_schedule_single_action(time(), self::$hook_order_update_from_moysklad, $args, 'WooMS');
+        $order_id = (int) $args['post_id'];
+        $context = self::get_order_update_context($order_id);
+        if (empty($args['generation'])) {
+            // Old scheduled actions only initiate adoption; they must not execute a newer generation.
+            if (!$context && ($context = self::get_order_update_context($order_id, true))) {
+                self::enqueue_webhook_action(self::$hook_order_update_from_moysklad, self::get_order_update_action_args($order_id, $context));
+            }
+            return;
         }
-
-        return;
+        if (!$context || $context['generation'] !== $args['generation'] || $context['request_id'] !== ($args['request_id'] ?? '')
+            || $context['order_uuid'] !== ($args['order_uuid'] ?? '')) {
+            return;
+        }
+        $attempt = $args['attempt'] ?? 0;
+        try {
+            if ('failed' === $context['status']) {
+                $active = $context;
+                $active['status'] = 'pending';
+                update_post_meta($order_id, self::$hook_order_update_from_moysklad, $active, $context);
+                if (get_post_meta($order_id, self::$hook_order_update_from_moysklad, true) !== $active) {
+                    throw new \RuntimeException('Could not resume the failed order update');
+                }
+                $context = $active;
+            }
+            if (!self::is_enable()) {
+                throw new \RuntimeException('Order updates from MoySklad are disabled');
+            }
+            self::update_order_from_moysklad($order_id, $context);
+            // A webhook received during the provider request owns a different marker and keeps its work.
+            delete_post_meta($order_id, self::$hook_order_update_from_moysklad, $context);
+            if (get_post_meta($order_id, self::$hook_order_update_from_moysklad, true) === $context) {
+                throw new \RuntimeException('Completed order update could not be acknowledged');
+            }
+        } catch (\Throwable $exception) {
+            $log = array('phase' => 'final_update', 'order_id' => $order_id, 'request_id' => $context['request_id'],
+                'order_uuid' => $context['order_uuid'], 'generation' => $context['generation'], 'attempt' => $attempt,
+                'error' => $exception->getMessage());
+            if (get_post_meta($order_id, self::$hook_order_update_from_moysklad, true) !== $context) {
+                $log['superseded'] = true;
+                do_action('wooms_logger_error', __CLASS__, 'Ошибка устаревшей задачи обновления заказа МойСклад', $log);
+                throw $exception;
+            }
+            $retry = OrderWebhookRetries::schedule_final_retry($args, $attempt);
+            $next = $context;
+            $next['status'] = is_wp_error($retry) ? 'failed' : 'pending';
+            update_post_meta($order_id, self::$hook_order_update_from_moysklad, $next, $context);
+            if (get_post_meta($order_id, self::$hook_order_update_from_moysklad, true) === $context && $next !== $context) {
+                $log['marker_error'] = 'Could not persist the terminal update state';
+            }
+            self::report_webhook_failure($exception, $retry, $log);
+        }
     }
 
     /**
      * update_order_from_moysklad
      */
-    public static function update_order_from_moysklad($order_id = 0)
+    public static function update_order_from_moysklad($order_id = 0, $context = null)
     {
         if (empty($order_id)) {
             return false;
@@ -388,24 +550,40 @@ class OrderUpdateFromMoySklad
             return false;
         }
 
-        if (!$wooms_id = $order->get_meta('wooms_id', true)) {
-            delete_post_meta($order_id, self::$hook_order_update_from_moysklad);
+        $wooms_id = strtolower((string) $order->get_meta('wooms_id', true));
+        if (!$wooms_id || ($context && $context['order_uuid'] !== $wooms_id)) {
             return false;
         }
 
         $url_api = sprintf('entity/customerorder/%s', $wooms_id);
 
         $data = request($url_api);
-
-        $order = apply_filters('wooms_update_order_from_moysklad', $order, $data);
-
-        $order->save();
+        if (!is_array($data) || !empty($data['errors']) || !is_string($data['id'] ?? null)
+            || strtolower($data['id']) !== $wooms_id || !is_numeric($data['sum'] ?? null) || !is_finite((float) $data['sum'])) {
+            throw new \RuntimeException('Invalid MoySklad customer order response');
+        }
+        $snapshot = array();
+        if (false !== has_filter('wooms_update_order_from_moysklad', array(__CLASS__, 'update_order_status'))) {
+            $snapshot['state_name'] = self::fetch_order_status($data);
+        }
+        if (false !== has_filter('wooms_update_order_from_moysklad', array(__CLASS__, 'update_order_items'))) {
+            $snapshot['items'] = self::fetch_order_items($data);
+        }
+        if (strtolower((string) get_post_meta($order_id, 'wooms_id', true)) !== $wooms_id
+            || ($context && get_post_meta($order_id, self::$hook_order_update_from_moysklad, true) !== $context)) {
+            return false;
+        }
+        $order = apply_filters('wooms_update_order_from_moysklad', $order, $data, $snapshot);
+        if (!$order instanceof \WC_Order || $order->get_id() !== $order_id) {
+            throw new \RuntimeException('Order update filter did not return the expected WooCommerce order');
+        }
+        self::persist_order_changes($order);
         $order = wc_get_order($order_id);
-
-
-        $order->save();
-
-        $order->calculate_totals();
+        if (!$order instanceof \WC_Order) {
+            throw new \RuntimeException('Updated WooCommerce order could not be reloaded');
+        }
+        self::persist_order_changes($order);
+        self::persist_order_changes($order, true);
 
         $sum = number_format($data['sum'] / 100, 2, '.', '');
         if ($sum != $order->get_total()) {
@@ -421,10 +599,40 @@ class OrderUpdateFromMoySklad
         do_action(
             'wooms_logger',
             __CLASS__,
-            sprintf('Заказ обновился данными из МойСклад (id %s, номер %s)', $order->get_id, $order->get_order_number())
+            sprintf('Заказ обновился данными из МойСклад (id %s, номер %s)', $order->get_id(), $order->get_order_number())
         );
 
         return $order_id;
+    }
+
+    /**
+     * WC_Order::save() can swallow an Exception and still return its ID.
+     * Observe the public save lifecycle to detect that failure, including saves
+     * inside calculate_totals(), without replacing the data store or logger.
+     * A custom store silently dropping writes without an exception is outside
+     * this signal's contract; this is not transactional verification.
+     */
+    private static function persist_order_changes($order, $calculate = false)
+    {
+        $started = 0;
+        $completed = 0;
+        $before = static function ($candidate) use ($order, &$started) {
+            if ($candidate === $order) { $started++; }
+        };
+        $after = static function ($candidate) use ($order, &$completed) {
+            if ($candidate === $order) { $completed++; }
+        };
+        add_action('woocommerce_before_order_object_save', $before, PHP_INT_MIN);
+        add_action('woocommerce_after_order_object_save', $after, PHP_INT_MAX);
+        try {
+            $result = $calculate ? $order->calculate_totals() : $order->save();
+            if (!$started || $started !== $completed || ($calculate ? false === $result : $result !== $order->get_id())) {
+                throw new \RuntimeException('WooCommerce order save did not complete');
+            }
+        } finally {
+            remove_action('woocommerce_before_order_object_save', $before, PHP_INT_MIN);
+            remove_action('woocommerce_after_order_object_save', $after, PHP_INT_MAX);
+        }
     }
 
 
@@ -1075,7 +1283,7 @@ class OrderUpdateFromMoySklad
         try {
             return self::enqueue_locked_webhook_action($hook, $args, $lock);
         } finally {
-            self::release_webhook_lock($lock, array('request_id' => $args['request_id'], 'hook' => $hook));
+            self::release_webhook_lock($lock, array('request_id' => $args['request_id'] ?? $args['data']['request_id'] ?? '', 'hook' => $hook));
         }
     }
 
@@ -1187,7 +1395,7 @@ class OrderUpdateFromMoySklad
     public static function process_order_webhook($order_id, $order_uuid, $request_id, $attempt = 0)
     {
         try {
-            self::prepare_webhook_order_update($order_id, $order_uuid, $request_id);
+            self::prepare_webhook_order_update($order_id, $order_uuid, $request_id, $attempt);
         } catch (\Throwable $exception) {
             $retry = OrderWebhookRetries::schedule_retry($order_id, $order_uuid, $request_id, $attempt);
             $context = array(
@@ -1226,13 +1434,17 @@ class OrderUpdateFromMoySklad
     /**
      * Fetch webhook order data and hand off to the existing order synchronization queue.
      */
-    private static function prepare_webhook_order_update($order_id, $order_uuid, $request_id)
+    private static function prepare_webhook_order_update($order_id, $order_uuid, $request_id, $attempt = 0)
     {
         if (!self::is_enable()) {
             throw new \RuntimeException('Webhook processing is disabled');
         }
 
         if (!self::can_process_webhook_order($order_id, $order_uuid)) {
+            return;
+        }
+        $pending = self::get_order_update_context($order_id);
+        if ($attempt > 0 && $pending && $pending['request_id'] !== $request_id) {
             return;
         }
 
@@ -1246,8 +1458,15 @@ class OrderUpdateFromMoySklad
             return;
         }
 
-        update_post_meta($order_id, self::$hook_order_update_from_moysklad, 1);
-        if (!get_post_meta($order_id, self::$hook_order_update_from_moysklad, true)) {
+        $pending = self::get_order_update_context($order_id);
+        if ($attempt > 0 && $pending && $pending['request_id'] !== $request_id) {
+            return;
+        }
+        $context = $pending && $pending['request_id'] === $request_id && $pending['order_uuid'] === $order_uuid
+            ? $pending : array('request_id' => $request_id, 'order_uuid' => $order_uuid,
+                'generation' => wp_generate_uuid4(), 'status' => 'pending');
+        update_post_meta($order_id, self::$hook_order_update_from_moysklad, $context);
+        if (get_post_meta($order_id, self::$hook_order_update_from_moysklad, true) !== $context) {
             throw new \RuntimeException('Order could not be queued for webhook ' . $request_id);
         }
         self::set_state('is_wait', 0);
@@ -1258,6 +1477,10 @@ class OrderUpdateFromMoySklad
             sprintf('Заказ %s поставлен в очередь на обновление из МойСклад (веб-хук %s)', $order_id, $request_id)
         );
         do_action('wooms_order_update_from_moysklad_action', $order_id, $data_order, $order_uuid);
+        // The scanner is a migration/repair fallback; its global wait flag must not own new work.
+        if ('pending' === $context['status'] && get_post_meta($order_id, self::$hook_order_update_from_moysklad, true) === $context) {
+            self::enqueue_webhook_action(self::$hook_order_update_from_moysklad, self::get_order_update_action_args($order_id, $context));
+        }
     }
 
     /**

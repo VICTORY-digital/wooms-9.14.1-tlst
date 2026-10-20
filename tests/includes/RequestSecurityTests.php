@@ -467,6 +467,9 @@ it('defers linked order provider work until the queued action runs', function (s
         }
     };
     $queue_filter = static function ($preempt, $hook, $args) use (&$queued_actions, &$queue_fails, &$queue_throws, $scenario) {
+        if ('wooms_order_update_from_moysklad' === $hook) {
+            return 808; // The final worker has its own persistence and retry contract tests.
+        }
         if ('wooms_process_order_webhook' !== $hook) {
             return $preempt;
         }
@@ -639,7 +642,11 @@ it('defers linked order provider work until the queued action runs', function (s
                 expect($sync_calls)->toBe(0);
                 expect(get_post_meta($order_id, 'lock_callback_update', true))->toBe('');
             } else {
-                expect((int) get_post_meta($order_id, OrderUpdateFromMoySklad::$hook_order_update_from_moysklad, true))->toBe(1);
+                $pending = get_post_meta($order_id, OrderUpdateFromMoySklad::$hook_order_update_from_moysklad, true);
+                expect($pending['request_id'] ?? null)->toBe($request_id);
+                expect($pending['order_uuid'] ?? null)->toBe($order_uuid);
+                expect($pending['status'] ?? null)->toBe('pending');
+                expect(is_string($pending['generation'] ?? null))->toBeTrue();
                 expect($sync_calls)->toBe(1);
                 expect($sync_payload)->toBe(array($order_id, $provider_data, $order_uuid));
             }
