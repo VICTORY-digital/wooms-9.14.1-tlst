@@ -8,6 +8,7 @@ $diagnostics = array();
 beforeEach(function () use (&$diagnostics): void {
     $diagnostics = array('records' => array(), 'http' => 0, 'had_start' => isset($_SERVER['REQUEST_TIME_FLOAT']),
         'start' => $_SERVER['REQUEST_TIME_FLOAT'] ?? null, 'request_id' => wp_generate_uuid4());
+    $diagnostics['server'] = rest_get_server();
     $_SERVER['REQUEST_TIME_FLOAT'] = microtime(true) - 0.1;
     $diagnostics['info'] = static function ($source, $title, $context = array()) use (&$diagnostics): void {
         if (OrderUpdateFromMoySklad::class === $source && 'http_response' === ($context['phase'] ?? '')) {
@@ -45,7 +46,7 @@ $diagnostic_request = static function ($route = '/wooms/v1/order-update/') use (
 it('records an accepted webhook response without changing it', function (int $status) use (&$diagnostics, $diagnostic_request): void {
     $request = $diagnostic_request('/wooms/v1/order-update');
     $response = new WP_REST_Response(null, $status);
-    expect(apply_filters('rest_post_dispatch', $response, null, $request))->toBe($response);
+    expect(apply_filters('rest_post_dispatch', $response, $diagnostics['server'], $request))->toBe($response);
     expect(count($diagnostics['records']))->toBe(1);
     $record = $diagnostics['records'][0];
     expect($record['level'])->toBe('info');
@@ -62,7 +63,7 @@ it('records an accepted webhook response without changing it', function (int $st
 
 it('records rejected responses including failures before the endpoint callback', function (int $status) use (&$diagnostics, $diagnostic_request): void {
     $response = new WP_REST_Response(array('code' => 'test_rest_failure', 'message' => 'private failure details'), $status);
-    expect(apply_filters('rest_post_dispatch', $response, null, $diagnostic_request()))->toBe($response);
+    expect(apply_filters('rest_post_dispatch', $response, $diagnostics['server'], $diagnostic_request()))->toBe($response);
     expect(count($diagnostics['records']))->toBe(1);
     $record = $diagnostics['records'][0];
     expect($record['level'])->toBe('error');
@@ -78,7 +79,7 @@ it('records rejected responses including failures before the endpoint callback',
 it('flags a slow successful PHP response without changing its status', function () use (&$diagnostics, $diagnostic_request): void {
     $_SERVER['REQUEST_TIME_FLOAT'] = microtime(true) - 2;
     $response = new WP_REST_Response(null, 204);
-    expect(apply_filters('rest_post_dispatch', $response, null, $diagnostic_request()))->toBe($response);
+    expect(apply_filters('rest_post_dispatch', $response, $diagnostics['server'], $diagnostic_request()))->toBe($response);
     $record = $diagnostics['records'][0];
     expect($record['level'])->toBe('error');
     expect($record['context']['provider_acceptable_status'])->toBeTrue();
@@ -92,7 +93,7 @@ it('omits malformed identifiers and skips decoding oversized bodies', function (
     $request->set_query_params(array('key' => 'never-log-this-webhook-secret', 'requestId' => array('malformed')));
     $request->set_body(str_repeat('x', 65537));
     $response = new WP_REST_Response(array('error' => 'Payload too large'), 413);
-    apply_filters('rest_post_dispatch', $response, null, $request);
+    apply_filters('rest_post_dispatch', $response, $diagnostics['server'], $request);
     expect(count($diagnostics['records']))->toBe(1);
     expect($diagnostics['records'][0]['context']['request_id'])->toBeNull();
     expect($diagnostics['records'][0]['context']['events_count'])->toBeNull();
@@ -100,21 +101,21 @@ it('omits malformed identifiers and skips decoding oversized bodies', function (
 
 it('leaves other REST routes alone', function () use (&$diagnostics, $diagnostic_request): void {
     $response = new WP_REST_Response(array('ok' => true), 200);
-    expect(apply_filters('rest_post_dispatch', $response, null, $diagnostic_request('/wooms/v1/order-update-extra')))->toBe($response);
+    expect(apply_filters('rest_post_dispatch', $response, $diagnostics['server'], $diagnostic_request('/wooms/v1/order-update-extra')))->toBe($response);
     expect($diagnostics['records'])->toBe(array());
 });
 
 it('handles a response to a webhook request without a body', function () use (&$diagnostics): void {
     $request = new WP_REST_Request('POST', '/wooms/v1/order-update/');
     $response = new WP_REST_Response(array('error' => 'Invalid webhook payload'), 400);
-    expect(apply_filters('rest_post_dispatch', $response, null, $request))->toBe($response);
+    expect(apply_filters('rest_post_dispatch', $response, $diagnostics['server'], $request))->toBe($response);
     expect(count($diagnostics['records']))->toBe(1);
     expect($diagnostics['records'][0]['context']['events_count'])->toBeNull();
 });
 
 it('uses a labelled fallback timer when PHP request time is unavailable', function () use (&$diagnostics, $diagnostic_request): void {
     unset($_SERVER['REQUEST_TIME_FLOAT']);
-    apply_filters('rest_post_dispatch', new WP_REST_Response(null, 204), null, $diagnostic_request());
+    apply_filters('rest_post_dispatch', new WP_REST_Response(null, 204), $diagnostics['server'], $diagnostic_request());
     expect($diagnostics['records'][0]['context']['timing_source'])->toBe('plugin_start');
     expect($diagnostics['records'][0]['context']['php_duration_ms'] >= 0)->toBeTrue();
 });
@@ -129,7 +130,7 @@ it('preserves the webhook response if a logging listener throws', function () us
     add_action('wooms_logger', $listener, 5);
     try {
         $response = new WP_REST_Response(null, 204);
-        expect(apply_filters('rest_post_dispatch', $response, null, $diagnostic_request()))->toBe($response);
+        expect(apply_filters('rest_post_dispatch', $response, $diagnostics['server'], $diagnostic_request()))->toBe($response);
         $fallback = file_get_contents($path);
         expect(false !== strpos($fallback, $diagnostics['request_id']))->toBeTrue();
         expect(false === strpos($fallback, 'never-log-this-webhook-secret'))->toBeTrue();

@@ -56,6 +56,7 @@ function wooms_request($url = '', $data = array(), $type = 'GET')
 
   $request = wp_remote_request($url, $args);
   if (is_wp_error($request)) {
+    \WooMS\IntegrationDiagnostics::record_api_response($url, $request);
     do_action(
       'wooms_logger_error',
       $type = 'WooMS-Request',
@@ -67,6 +68,7 @@ function wooms_request($url = '', $data = array(), $type = 'GET')
   }
 
   if (empty($request['body'])) {
+    \WooMS\IntegrationDiagnostics::record_api_response($url, $request);
     do_action(
       'wooms_logger_error',
       $type = 'WooMS-Request',
@@ -77,6 +79,7 @@ function wooms_request($url = '', $data = array(), $type = 'GET')
   }
 
   $response = json_decode($request['body'], true);
+  \WooMS\IntegrationDiagnostics::record_api_response($url, $request, $response);
 
   if (!empty($response["errors"]) and is_array($response["errors"])) {
     foreach ($response["errors"] as $error) {

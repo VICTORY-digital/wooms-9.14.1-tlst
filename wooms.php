@@ -40,6 +40,7 @@ register_deactivation_hook(__FILE__, function () {
 
 
 require_once __DIR__.'/includes/MoySkladApiUrl.php';
+require_once __DIR__.'/includes/IntegrationDiagnostics.php';
 require_once __DIR__.'/includes/functions.php';
 
 if (defined('WP_CLI') && WP_CLI) {
@@ -176,6 +177,7 @@ function request($path = '', $data = array(), $type = 'GET')
 
 	$request = wp_remote_request($url, $args);
 	if (is_wp_error($request)) {
+		IntegrationDiagnostics::record_api_response($url, $request);
 		do_action(
 			'wooms_logger_error',
 			$type = 'WooMS-Request',
@@ -187,6 +189,7 @@ function request($path = '', $data = array(), $type = 'GET')
 	}
 
 	if (empty($request['body'])) {
+		IntegrationDiagnostics::record_api_response($url, $request);
 		do_action(
 			'wooms_logger_error',
 			$type = 'WooMS-Request',
@@ -197,6 +200,7 @@ function request($path = '', $data = array(), $type = 'GET')
 	}
 
 	$response = json_decode($request['body'], true);
+	IntegrationDiagnostics::record_api_response($url, $request, $response);
 
 	if (! empty($response["errors"]) and is_array($response["errors"])) {
 		foreach ($response["errors"] as $error) {
