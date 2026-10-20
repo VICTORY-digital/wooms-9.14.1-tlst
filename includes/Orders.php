@@ -110,7 +110,16 @@ class Orders
                 sprintf('Пропуск Заказ %s - обновлен', $order_id)
             );
 
-            delete_post_meta($order_id, 'wooms_order_sync');
+            $sync_order = clone $order;
+            $sync_order->read_meta_data(true);
+            $sync_order->delete_meta_data('wooms_order_sync');
+            $meta_only = static function () { return false; };
+            add_filter('woocommerce_orders_table_datastore_should_save_after_meta_change', $meta_only, PHP_INT_MAX);
+            try {
+                $sync_order->save_meta_data();
+            } finally {
+                remove_filter('woocommerce_orders_table_datastore_should_save_after_meta_change', $meta_only, PHP_INT_MAX);
+            }
 
             return false;
         }
@@ -282,7 +291,7 @@ class Orders
         }
 
         $order = wc_get_order($order_id);
-        if (!$order->get_items()) {
+        if (!$order || !$order->get_items()) {
             return;
         }
 

@@ -61,20 +61,24 @@ class OrderUpdateFromMoySklad
 
         add_filter('wooms_skip_order_update', array(__CLASS__, 'skip_order_update_from_site'), 10, 2);
 
-        add_action('save_post_shop_order', array(__CLASS__, 'lock_callback_update'));
+        add_action('woocommerce_before_order_object_save', array(__CLASS__, 'lock_callback_update'));
+        add_filter('woocommerce_order_data_store_cpt_get_orders_query', array(__CLASS__, 'map_webhook_order_query'), 10, 2);
     }
 
 
-    public static function lock_callback_update($order_id)
+    public static function lock_callback_update($order)
     {
+        if (!$order instanceof \WC_Order) {
+            return;
+        }
 
         //если стоит задача на апдейт из МойСклад, то пропускаем
-        $marker = get_post_meta($order_id, self::$hook_order_update_from_moysklad, true);
+        $marker = self::get_order_meta($order->get_id(), self::$hook_order_update_from_moysklad);
         if ($marker && (!is_array($marker) || 'failed' !== ($marker['status'] ?? ''))) {
             return;
         }
 
-        update_post_meta($order_id, 'lock_callback_update', 1);
+        $order->update_meta_data('lock_callback_update', 1);
     }
 
 
@@ -367,7 +371,7 @@ class OrderUpdateFromMoySklad
             return $skip;
         }
 
-        $task_exist = $order->get_meta(self::$hook_order_update_from_moysklad, true);
+        $task_exist = self::get_order_meta($order->get_id(), self::$hook_order_update_from_moysklad);
 
         if ($task_exist && (!is_array($task_exist) || 'failed' !== ($task_exist['status'] ?? ''))) {
             return true;
@@ -409,31 +413,14 @@ class OrderUpdateFromMoySklad
             return;
         }
 
-        $args = [
-            'post_type'   => 'shop_order',
-            'post_status' => 'any',
-            'meta_query'             => array(
-                array(
-                    'key'     => self::$hook_order_update_from_moysklad,
-                    'compare' => 'EXISTS',
-                ),
-            ),
-            'no_found_rows'          => true,
-            'update_post_term_cache' => false,
-            'update_post_meta_cache' => false,
-            'cache_results'          => false,
-            'numberposts'            => -1,
-            'fields'                 => 'ids',
-            'orderby'                => 'ID',
-            'order'                  => 'ASC',
-        ];
-
-        $order_ids = get_posts($args);
+        $order_ids = self::query_webhook_order_ids(array(array(
+            'key' => self::$hook_order_update_from_moysklad,
+            'compare' => 'EXISTS',
+        )));
 
 
         $has_pending = false;
         foreach (array_chunk($order_ids, 100) as $chunk) {
-            update_meta_cache('post', $chunk);
             foreach ($chunk as $order_id) {
                 $context = self::get_order_update_context($order_id, true);
                 if (!$context || 'pending' !== $context['status']) {
@@ -453,20 +440,106 @@ class OrderUpdateFromMoySklad
         self::set_state('is_wait', $has_pending ? 0 : 1);
     }
 
+    /**
+     * Map this plugin's metadata constraints to the legacy order query.
+     *
+     * @internal
+     * @param array $query WordPress query arguments.
+     * @param array $query_vars WooCommerce order query arguments.
+     * @return array
+     */
+    public static function map_webhook_order_query($query, $query_vars)
+    {
+        if (isset($query_vars['wooms_webhook_meta_query'])) {
+            $query['meta_query'][] = $query_vars['wooms_webhook_meta_query'];
+        }
+        return $query;
+    }
+
+    private static function query_webhook_order_ids(array $meta_query, $limit = -1)
+    {
+        $args = array('type' => 'shop_order', 'status' => 'any', 'return' => 'ids',
+            'limit' => $limit, 'orderby' => 'ID', 'order' => 'ASC', 'cache_results' => false);
+        $hpos = class_exists(\Automattic\WooCommerce\Utilities\OrderUtil::class)
+            && \Automattic\WooCommerce\Utilities\OrderUtil::custom_orders_table_usage_is_enabled();
+        $args[$hpos ? 'meta_query' : 'wooms_webhook_meta_query'] = $meta_query;
+        return array_map('intval', wc_get_orders($args));
+    }
+
+    /** Refresh a separate object so a cached caller keeps its unsaved metadata. */
+    private static function get_fresh_order($order_id)
+    {
+        $order = wc_get_order($order_id);
+        if (!$order instanceof \WC_Order) {
+            return false;
+        }
+        $order = clone $order;
+        $order->read_meta_data(true);
+        return $order;
+    }
+
+    private static function get_order_meta($order_id, $key)
+    {
+        $order = self::get_fresh_order($order_id);
+        return $order ? $order->get_meta($key, true, 'edit') : '';
+    }
+
+    /**
+     * Compare and change authoritative metadata under a shared order lease.
+     * Null deletes the key. A superseded value returns false; storage failure throws.
+     * No provider request or explicit order save belongs in this critical section.
+     *
+     * @return bool
+     */
+    private static function change_order_meta($order_id, $key, $expected, $next)
+    {
+        $lock = OrderWebhookLock::acquire('order-state:' . $order_id);
+        if (is_wp_error($lock)) {
+            throw new \RuntimeException($lock->get_error_message());
+        }
+        try {
+            $order = self::get_fresh_order($order_id);
+            if (!$order || $order->get_meta($key, true, 'edit') !== $expected) {
+                return false;
+            }
+            self::require_webhook_lock($lock);
+            if (null === $next) {
+                $order->delete_meta_data($key);
+            } else {
+                $order->update_meta_data($key, $next);
+            }
+            // HPOS may otherwise trigger a full order save, including outbound hooks.
+            $meta_only = static function () { return false; };
+            add_filter('woocommerce_orders_table_datastore_should_save_after_meta_change', $meta_only, PHP_INT_MAX);
+            try {
+                $order->save_meta_data();
+            } finally {
+                remove_filter('woocommerce_orders_table_datastore_should_save_after_meta_change', $meta_only, PHP_INT_MAX);
+            }
+            $order->read_meta_data(true);
+            if ($order->get_meta($key, true, 'edit') !== (null === $next ? '' : $next)) {
+                throw new \RuntimeException('WooCommerce order metadata could not be persisted');
+            }
+            return true;
+        } finally {
+            self::release_webhook_lock($lock, array('order_id' => $order_id, 'meta_key' => $key));
+        }
+    }
+
     /** Adopt pre-upgrade scalar markers once, preserving newer notification generations. */
     private static function get_order_update_context($order_id, $adopt_legacy = false)
     {
-        $marker = get_post_meta($order_id, self::$hook_order_update_from_moysklad, true);
+        $marker = self::get_order_meta($order_id, self::$hook_order_update_from_moysklad);
         if ($adopt_legacy && $marker && !is_array($marker)) {
-            $uuid = strtolower((string) get_post_meta($order_id, 'wooms_id', true));
+            $uuid = strtolower((string) self::get_order_meta($order_id, 'wooms_id'));
             if (!$uuid) {
-                delete_post_meta($order_id, self::$hook_order_update_from_moysklad, $marker);
+                self::change_order_meta($order_id, self::$hook_order_update_from_moysklad, $marker, null);
                 return false;
             }
             $context = array('request_id' => 'legacy-' . wp_generate_uuid4(), 'order_uuid' => $uuid,
                 'generation' => wp_generate_uuid4(), 'status' => 'pending');
-            update_post_meta($order_id, self::$hook_order_update_from_moysklad, $context, $marker);
-            $marker = get_post_meta($order_id, self::$hook_order_update_from_moysklad, true);
+            self::change_order_meta($order_id, self::$hook_order_update_from_moysklad, $marker, $context);
+            $marker = self::get_order_meta($order_id, self::$hook_order_update_from_moysklad);
         }
         if (!is_array($marker) || empty($marker['request_id']) || empty($marker['order_uuid']) || empty($marker['generation'])
             || !in_array($marker['status'] ?? '', array('pending', 'failed'), true)) {
@@ -505,8 +578,7 @@ class OrderUpdateFromMoySklad
             if ('failed' === $context['status']) {
                 $active = $context;
                 $active['status'] = 'pending';
-                update_post_meta($order_id, self::$hook_order_update_from_moysklad, $active, $context);
-                if (get_post_meta($order_id, self::$hook_order_update_from_moysklad, true) !== $active) {
+                if (!self::change_order_meta($order_id, self::$hook_order_update_from_moysklad, $context, $active)) {
                     throw new \RuntimeException('Could not resume the failed order update');
                 }
                 $context = $active;
@@ -516,15 +588,12 @@ class OrderUpdateFromMoySklad
             }
             self::update_order_from_moysklad($order_id, $context);
             // A webhook received during the provider request owns a different marker and keeps its work.
-            delete_post_meta($order_id, self::$hook_order_update_from_moysklad, $context);
-            if (get_post_meta($order_id, self::$hook_order_update_from_moysklad, true) === $context) {
-                throw new \RuntimeException('Completed order update could not be acknowledged');
-            }
+            self::change_order_meta($order_id, self::$hook_order_update_from_moysklad, $context, null);
         } catch (\Throwable $exception) {
             $log = array('phase' => 'final_update', 'order_id' => $order_id, 'request_id' => $context['request_id'],
                 'order_uuid' => $context['order_uuid'], 'generation' => $context['generation'], 'attempt' => $attempt,
                 'error' => $exception->getMessage());
-            if (get_post_meta($order_id, self::$hook_order_update_from_moysklad, true) !== $context) {
+            if (self::get_order_meta($order_id, self::$hook_order_update_from_moysklad) !== $context) {
                 $log['superseded'] = true;
                 do_action('wooms_logger_error', __CLASS__, 'Ошибка устаревшей задачи обновления заказа МойСклад', $log);
                 throw $exception;
@@ -532,8 +601,7 @@ class OrderUpdateFromMoySklad
             $retry = OrderWebhookRetries::schedule_final_retry($args, $attempt);
             $next = $context;
             $next['status'] = is_wp_error($retry) ? 'failed' : 'pending';
-            update_post_meta($order_id, self::$hook_order_update_from_moysklad, $next, $context);
-            if (get_post_meta($order_id, self::$hook_order_update_from_moysklad, true) === $context && $next !== $context) {
+            if (!self::change_order_meta($order_id, self::$hook_order_update_from_moysklad, $context, $next)) {
                 $log['marker_error'] = 'Could not persist the terminal update state';
             }
             self::report_webhook_failure($exception, $retry, $log);
@@ -550,7 +618,7 @@ class OrderUpdateFromMoySklad
         }
 
         $order_id = intval($order_id);
-        if (!$order = wc_get_order($order_id)) {
+        if (!$order = self::get_fresh_order($order_id)) {
             return false;
         }
 
@@ -573,8 +641,8 @@ class OrderUpdateFromMoySklad
         if (false !== has_filter('wooms_update_order_from_moysklad', array(__CLASS__, 'update_order_items'))) {
             $snapshot['items'] = self::fetch_order_items($data);
         }
-        if (strtolower((string) get_post_meta($order_id, 'wooms_id', true)) !== $wooms_id
-            || ($context && get_post_meta($order_id, self::$hook_order_update_from_moysklad, true) !== $context)) {
+        if (strtolower((string) self::get_order_meta($order_id, 'wooms_id')) !== $wooms_id
+            || ($context && self::get_order_meta($order_id, self::$hook_order_update_from_moysklad) !== $context)) {
             return false;
         }
         $order = apply_filters('wooms_update_order_from_moysklad', $order, $data, $snapshot);
@@ -1268,8 +1336,9 @@ class OrderUpdateFromMoySklad
             do_action('wooms_logger', __CLASS__, sprintf('Веб-хук %s пропущен: заказ МойСклад %s не связан с заказом сайта', $request_id, $order_uuid));
             return new \WP_REST_Response(null, 204);
         }
-        if (get_post_meta($order_id, 'lock_callback_update', true)) {
-            delete_post_meta($order_id, 'lock_callback_update');
+        $callback_lock = self::get_order_meta($order_id, 'lock_callback_update');
+        if ($callback_lock) {
+            self::change_order_meta($order_id, 'lock_callback_update', $callback_lock, null);
             return new \WP_REST_Response(array('success' => 'Order update is already locked'), 200);
         }
         return self::enqueue_webhook_request(
@@ -1372,14 +1441,8 @@ class OrderUpdateFromMoySklad
 
     private static function find_webhook_order_id($order_uuid)
     {
-        $orders = get_posts(array(
-            'numberposts' => 1,
-            'post_type' => 'shop_order',
-            'post_status' => 'any',
-            'meta_key' => 'wooms_id',
-            'meta_value' => $order_uuid,
-        ));
-        return empty($orders[0]->ID) ? 0 : $orders[0]->ID;
+        $orders = self::query_webhook_order_ids(array(array('key' => 'wooms_id', 'value' => $order_uuid)), 1);
+        return empty($orders) ? 0 : reset($orders);
     }
 
     private static function get_webhook_order_args($order_id, $order_uuid, $request_id)
@@ -1516,6 +1579,7 @@ class OrderUpdateFromMoySklad
             return;
         }
 
+        $marker = self::get_order_meta($order_id, self::$hook_order_update_from_moysklad);
         $pending = self::get_order_update_context($order_id);
         if ($attempt > 0 && $pending && $pending['request_id'] !== $request_id) {
             return;
@@ -1523,8 +1587,7 @@ class OrderUpdateFromMoySklad
         $context = $pending && $pending['request_id'] === $request_id && $pending['order_uuid'] === $order_uuid
             ? $pending : array('request_id' => $request_id, 'order_uuid' => $order_uuid,
                 'generation' => wp_generate_uuid4(), 'status' => 'pending');
-        update_post_meta($order_id, self::$hook_order_update_from_moysklad, $context);
-        if (get_post_meta($order_id, self::$hook_order_update_from_moysklad, true) !== $context) {
+        if (!self::change_order_meta($order_id, self::$hook_order_update_from_moysklad, $marker, $context)) {
             throw new \RuntimeException('Order could not be queued for webhook ' . $request_id);
         }
         self::set_state('is_wait', 0);
@@ -1536,7 +1599,7 @@ class OrderUpdateFromMoySklad
         );
         do_action('wooms_order_update_from_moysklad_action', $order_id, $data_order, $order_uuid);
         // The scanner is a migration/repair fallback; its global wait flag must not own new work.
-        if ('pending' === $context['status'] && get_post_meta($order_id, self::$hook_order_update_from_moysklad, true) === $context) {
+        if ('pending' === $context['status'] && self::get_order_meta($order_id, self::$hook_order_update_from_moysklad) === $context) {
             self::enqueue_webhook_action(self::$hook_order_update_from_moysklad, self::get_order_update_action_args($order_id, $context));
         }
     }
@@ -1546,11 +1609,12 @@ class OrderUpdateFromMoySklad
      */
     private static function can_process_webhook_order($order_id, $order_uuid)
     {
-        if (strtolower((string) get_post_meta($order_id, 'wooms_id', true)) !== $order_uuid) {
+        if (strtolower((string) self::get_order_meta($order_id, 'wooms_id')) !== $order_uuid) {
             return false;
         }
-        if (get_post_meta($order_id, 'lock_callback_update', true)) {
-            delete_post_meta($order_id, 'lock_callback_update');
+        $callback_lock = self::get_order_meta($order_id, 'lock_callback_update');
+        if ($callback_lock) {
+            self::change_order_meta($order_id, 'lock_callback_update', $callback_lock, null);
             return false;
         }
         return true;
