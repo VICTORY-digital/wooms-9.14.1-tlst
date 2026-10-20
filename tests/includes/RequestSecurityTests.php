@@ -275,9 +275,8 @@ it('enqueues an authenticated webhook once and acknowledges accepted retries', f
     try {
         expect(OrderUpdateFromMoySklad::authorize_webhook($request))->toBeTrue();
 
-        $in_flight = OrderUpdateFromMoySklad::authorize_webhook($request);
-        expect($in_flight)->toBeInstanceOf(WP_Error::class);
-        expect($in_flight->get_error_data()['status'] ?? null)->toBe(409);
+        // REST permission checks can run more than once before the callback.
+        expect(OrderUpdateFromMoySklad::authorize_webhook($request))->toBeTrue();
 
         $response = OrderUpdateFromMoySklad::get_data_order_from_moysklad($request);
         expect(OrderUpdateFromMoySklad::authorize_webhook($request))->toBeTrue();

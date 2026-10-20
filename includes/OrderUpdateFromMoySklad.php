@@ -2,8 +2,6 @@
 
 namespace WooMS;
 
-use Exception;
-
 use function WooMS\request;
 
 
@@ -761,7 +759,7 @@ class OrderUpdateFromMoySklad
     }
 
     /**
-     * Authenticate, rate limit, and reserve a webhook event before handling it.
+     * Authenticate and validate request limits without reserving work during REST permission checks.
      *
      * @param \WP_REST_Request $request REST request.
      * @return true|\WP_Error
@@ -803,33 +801,6 @@ class OrderUpdateFromMoySklad
                 array('status' => 400)
             );
         }
-
-        $replay_key = self::get_webhook_replay_key($request_id);
-        $replay_state = get_transient($replay_key);
-        if ('processed' === $replay_state) {
-            // MoySklad requires HTTP 200/204 even for already processed notifications.
-            return true;
-        }
-        if (false !== $replay_state) {
-            return new \WP_Error(
-                'wooms_webhook_replayed',
-                'This webhook event has already been received.',
-                array('status' => 409)
-            );
-        }
-
-        $rate_key = self::$webhook_rate_prefix . gmdate('YmdHi');
-        $request_count = (int) get_transient($rate_key);
-        if (120 <= $request_count) {
-            return new \WP_Error(
-                'wooms_webhook_rate_limited',
-                'Webhook rate limit exceeded.',
-                array('status' => 429)
-            );
-        }
-
-        set_transient($rate_key, $request_count + 1, 2 * MINUTE_IN_SECONDS);
-        set_transient($replay_key, 'processing', 5 * MINUTE_IN_SECONDS);
 
         return true;
     }
@@ -899,37 +870,57 @@ class OrderUpdateFromMoySklad
         return self::$webhook_replay_prefix . hash('sha256', $request_id);
     }
 
+    /** Re-read database-backed transients after ownership may have changed in another request. */
+    private static function is_webhook_processed($request_id)
+    {
+        if (false === $request_id) {
+            return false;
+        }
+        $key = self::get_webhook_replay_key($request_id);
+        if (!wp_using_ext_object_cache()) {
+            wp_cache_delete('_transient_' . $key, 'options');
+            wp_cache_delete('_transient_timeout_' . $key, 'options');
+            wp_cache_delete('notoptions', 'options');
+        }
+        return 'processed' === get_transient($key);
+    }
+
     /**
      * Keep a replay marker after successful processing.
      *
      * @param \WP_REST_Request $request REST request.
      * @return void
      */
-    private static function mark_webhook_processed($request)
+    private static function mark_webhook_processed($request, $lock)
     {
+        self::require_webhook_lock($lock);
         $request_id = self::get_webhook_request_id($request);
         if (false !== $request_id) {
-            set_transient(self::get_webhook_replay_key($request_id), 'processed', DAY_IN_SECONDS);
-        }
-    }
-
-    /**
-     * Release an in-flight replay marker after a processing failure.
-     *
-     * @param \WP_REST_Request $request REST request.
-     * @return void
-     */
-    private static function release_webhook_request($request)
-    {
-        $request_id = self::get_webhook_request_id($request);
-        if (false !== $request_id) {
-            $replay_key = self::get_webhook_replay_key($request_id);
-            if ('processing' === get_transient($replay_key)) {
-                delete_transient($replay_key);
+            $key = self::get_webhook_replay_key($request_id);
+            if (!set_transient($key, 'processed', DAY_IN_SECONDS) && 'processed' !== get_transient($key)) {
+                throw new \RuntimeException('Webhook acknowledgement could not be persisted');
             }
         }
     }
 
+    private static function require_webhook_lock($lock)
+    {
+        $result = $lock->renew();
+        if (is_wp_error($result)) {
+            throw new \RuntimeException($result->get_error_message());
+        }
+    }
+
+    private static function release_webhook_lock($lock, array $context)
+    {
+        $result = $lock->release();
+        if (is_wp_error($result)) {
+            do_action('wooms_logger_error', __CLASS__, 'Не удалось освободить блокировку веб-хука', array_merge($context, array(
+                'phase' => 'release',
+                'error_code' => $result->get_error_code(),
+            )));
+        }
+    }
 
     /**
      * Get data from MoySkald and start update order
@@ -940,108 +931,98 @@ class OrderUpdateFromMoySklad
      */
     public static function get_data_order_from_moysklad($data_request)
     {
-        try {
-            $request_id = self::get_webhook_request_id($data_request);
-            $body = $data_request->get_body();
-            $data = json_decode($body, true);
-            $already_processed = false !== $request_id
-                && 'processed' === get_transient(self::get_webhook_replay_key($request_id));
-
-            if (!$already_processed) {
-                do_action(
-                    'wooms_logger',
-                    __CLASS__,
-                    sprintf('Прилетел веб-хук %s', $request_id),
-                    $data
-                );
-            }
-
-            if (!self::is_enable()) {
-                self::release_webhook_request($data_request);
-                return new \WP_REST_Response(array('error' => 'Webhook processing is disabled'), 503);
-            }
-
-            $events = is_array($data) ? ($data['events'] ?? null) : null;
-            if (!is_array($events) || empty($events) || array_keys($events) !== range(0, count($events) - 1)) {
-                self::release_webhook_request($data_request);
+        $request_id = self::get_webhook_request_id($data_request);
+        $data = json_decode($data_request->get_body(), true);
+        $events = is_array($data) ? ($data['events'] ?? null) : null;
+        if (!is_array($events) || empty($events) || array_keys($events) !== range(0, count($events) - 1)) {
+            return new \WP_REST_Response(array('error' => 'Invalid webhook payload'), 400);
+        }
+        $order_uuids = array();
+        foreach ($events as $event) {
+            $path = MoySkladApiUrl::get_customer_order_path($event['meta']['href'] ?? null);
+            if (false === $path) {
+                do_action('wooms_logger_error', __CLASS__, 'Отклонен webhook с небезопасным адресом заказа МойСклад');
                 return new \WP_REST_Response(array('error' => 'Invalid webhook payload'), 400);
             }
-
-            $order_uuids = array();
-            foreach ($events as $event) {
-                $order_path = MoySkladApiUrl::get_customer_order_path($event['meta']['href'] ?? null);
-                if (false === $order_path) {
-                    do_action(
-                        'wooms_logger_error',
-                        __CLASS__,
-                        'Отклонен webhook с небезопасным адресом заказа МойСклад'
-                    );
-
-                    self::release_webhook_request($data_request);
-                    return new \WP_REST_Response(array('error' => 'Invalid webhook payload'), 400);
-                }
-                $order_uuids[] = basename($order_path);
-            }
-            $order_uuids = array_values(array_unique($order_uuids));
-
-            if ($already_processed) {
+            $order_uuids[] = basename($path);
+        }
+        $order_uuids = array_values(array_unique($order_uuids));
+        if (self::is_webhook_processed($request_id)) {
+            return new \WP_REST_Response(null, 204);
+        }
+        $lock = OrderWebhookLock::acquire('request:' . $request_id);
+        if (is_wp_error($lock)) {
+            do_action('wooms_logger_error', __CLASS__, 'Веб-хук временно не принят в обработку', array(
+                'phase' => 'claim', 'request_id' => $request_id, 'error_code' => $lock->get_error_code(),
+            ));
+            return new \WP_REST_Response(array('error' => $lock->get_error_message()), $lock->get_error_data()['status']);
+        }
+        try {
+            // A competing owner may have completed between our first read and acquisition.
+            if (self::is_webhook_processed($request_id)) {
                 return new \WP_REST_Response(null, 204);
             }
-
-            if (count($order_uuids) > 1) {
-                return self::enqueue_webhook_request(
-                    $data_request,
-                    self::$hook_dispatch_webhook_batch,
-                    self::get_webhook_batch_args($request_id, $order_uuids),
-                    true
-                );
+            if (!self::is_enable()) {
+                return new \WP_REST_Response(array('error' => 'Webhook processing is disabled'), 503);
             }
-
-            $order_uuid = $order_uuids[0];
-            $order_id = self::find_webhook_order_id($order_uuid);
-
-            if (!$order_id) {
-                do_action(
-                    'wooms_logger',
-                    __CLASS__,
-                    sprintf('Веб-хук %s пропущен: заказ МойСклад %s не связан с заказом сайта', $request_id, $order_uuid)
-                );
-                self::mark_webhook_processed($data_request);
-                return new \WP_REST_Response(null, 204);
+            $rate_key = self::$webhook_rate_prefix . gmdate('YmdHi');
+            $request_count = (int) get_transient($rate_key);
+            if (120 <= $request_count) {
+                return new \WP_REST_Response(array('error' => 'Webhook rate limit exceeded'), 429);
             }
-
-            //Если стоит блокировка обновления Заказа, то выходим (защита от состояния гонки)
-            if (get_post_meta($order_id, 'lock_callback_update', true)) {
-                delete_post_meta($order_id, 'lock_callback_update');
-                self::mark_webhook_processed($data_request);
-                return new \WP_REST_Response(array('success' => 'Order update is already locked'), 200);
+            set_transient($rate_key, $request_count + 1, 2 * MINUTE_IN_SECONDS);
+            do_action('wooms_logger', __CLASS__, sprintf('Прилетел веб-хук %s', $request_id), $data);
+            self::require_webhook_lock($lock);
+            $response = self::handle_webhook_orders($order_uuids, $request_id);
+            if (in_array($response->get_status(), array(200, 204), true)) {
+                self::mark_webhook_processed($data_request, $lock);
             }
-
-            return self::enqueue_webhook_request(
-                $data_request,
-                self::$hook_process_webhook,
-                array(self::get_webhook_order_args($order_id, $order_uuid, $request_id))
-            );
-        } catch (Exception $e) {
-            self::release_webhook_request($data_request);
-            $response = new \WP_REST_Response(array('fail', $e->getMessage()));
-            $response->set_status(500);
             return $response;
+        } catch (\Throwable $exception) {
+            do_action('wooms_logger_error', __CLASS__, 'Ошибка приёма веб-хука МойСклад', array(
+                'phase' => 'receive', 'request_id' => $request_id, 'error' => $exception->getMessage(),
+            ));
+            return new \WP_REST_Response(array('error' => 'Webhook could not be accepted'), 503);
+        } finally {
+            self::release_webhook_lock($lock, array('request_id' => $request_id));
         }
     }
 
+    private static function handle_webhook_orders(array $order_uuids, $request_id)
+    {
+        if (count($order_uuids) > 1) {
+            return self::enqueue_webhook_request(
+                self::$hook_dispatch_webhook_batch,
+                self::get_webhook_batch_args($request_id, $order_uuids)
+            );
+        }
+        $order_uuid = $order_uuids[0];
+        $order_id = self::find_webhook_order_id($order_uuid);
+        if (!$order_id) {
+            do_action('wooms_logger', __CLASS__, sprintf('Веб-хук %s пропущен: заказ МойСклад %s не связан с заказом сайта', $request_id, $order_uuid));
+            return new \WP_REST_Response(null, 204);
+        }
+        if (get_post_meta($order_id, 'lock_callback_update', true)) {
+            delete_post_meta($order_id, 'lock_callback_update');
+            return new \WP_REST_Response(array('success' => 'Order update is already locked'), 200);
+        }
+        return self::enqueue_webhook_request(
+            self::$hook_process_webhook,
+            array(self::get_webhook_order_args($order_id, $order_uuid, $request_id))
+        );
+    }
+
     /** Acknowledge a notification only after all of its initial actions were persisted. */
-    private static function enqueue_webhook_request($request, $hook, array $action_args, $check_existing = false)
+    private static function enqueue_webhook_request($hook, array $action_args)
     {
         $action_ids = array();
         $args = $action_args[0];
         $request_id = $args['request_id'];
         try {
             foreach ($action_args as $args) {
-                $action_ids[] = self::enqueue_webhook_action($hook, $args, $check_existing);
+                $action_ids[] = self::enqueue_webhook_action($hook, $args);
             }
         } catch (\Throwable $exception) {
-            self::release_webhook_request($request);
             do_action(
                 'wooms_logger_error',
                 __CLASS__,
@@ -1051,7 +1032,6 @@ class OrderUpdateFromMoySklad
             return new \WP_REST_Response(array('error' => 'Webhook could not be queued'), 503);
         }
 
-        self::mark_webhook_processed($request);
         do_action(
             'wooms_logger',
             __CLASS__,
@@ -1079,17 +1059,36 @@ class OrderUpdateFromMoySklad
     }
 
     /** Resolve ambiguous inserts before retrying; sequential replays can reuse retained AS records. */
-    private static function enqueue_webhook_action($hook, array $args, $check_existing)
+    private static function enqueue_webhook_action($hook, array $args)
     {
-        if ($check_existing) {
-            $accepted_id = self::find_accepted_webhook_action($hook, $args);
-            if ($accepted_id) {
-                return $accepted_id;
+        $resource = 'action:' . hash('sha256', wp_json_encode(array($hook, $args, 'WooMS')));
+        $lock = OrderWebhookLock::acquire($resource);
+        if (is_wp_error($lock)) {
+            if ('wooms_webhook_busy' === $lock->get_error_code()) {
+                $accepted_id = self::find_accepted_webhook_action($hook, $args);
+                if ($accepted_id) {
+                    return $accepted_id;
+                }
             }
+            throw new \RuntimeException($lock->get_error_message());
+        }
+        try {
+            return self::enqueue_locked_webhook_action($hook, $args, $lock);
+        } finally {
+            self::release_webhook_lock($lock, array('request_id' => $args['request_id'], 'hook' => $hook));
+        }
+    }
+
+    private static function enqueue_locked_webhook_action($hook, array $args, $lock)
+    {
+        $accepted_id = self::find_accepted_webhook_action($hook, $args);
+        if ($accepted_id) {
+            return $accepted_id;
         }
 
         $action_id = 0;
         $queue_error = 'Action Scheduler did not return a persisted action ID';
+        self::require_webhook_lock($lock);
         try {
             $action_id = as_enqueue_async_action($hook, $args, 'WooMS');
         } catch (\Throwable $exception) {
@@ -1098,11 +1097,9 @@ class OrderUpdateFromMoySklad
         if (is_int($action_id) && $action_id > 0) {
             return $action_id;
         }
-        if ($check_existing) {
-            $accepted_id = self::find_accepted_webhook_action($hook, $args);
-            if ($accepted_id) {
-                return $accepted_id;
-            }
+        $accepted_id = self::find_accepted_webhook_action($hook, $args);
+        if ($accepted_id) {
+            return $accepted_id;
         }
         throw new \RuntimeException($queue_error);
     }
@@ -1141,7 +1138,7 @@ class OrderUpdateFromMoySklad
                 $order_id = self::find_webhook_order_id($order_uuid);
                 if ($order_id) {
                     $args = self::get_webhook_order_args($order_id, $order_uuid, $request_id);
-                    self::enqueue_webhook_action(self::$hook_process_webhook, $args, true);
+                    self::enqueue_webhook_action(self::$hook_process_webhook, $args);
                 }
                 // Callback locks belong to the child worker, so dispatcher retries cannot consume them twice.
                 array_shift($remaining);

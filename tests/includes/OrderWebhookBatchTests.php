@@ -24,6 +24,8 @@ beforeEach(function () use (&$batch): void {
         'parent_failure' => '',
         'parent_fail_at' => 0,
         'parent_calls' => 0,
+        'on_enqueue' => null,
+        'on_persist' => null,
         'failure_used' => false,
         'retry_failure' => false,
     );
@@ -58,6 +60,9 @@ beforeEach(function () use (&$batch): void {
         if (!in_array($hook, array('wooms_process_order_webhook', 'wooms_dispatch_order_webhook_batch'), true)) {
             return $preempt;
         }
+        if (is_callable($batch['on_enqueue'])) {
+            ($batch['on_enqueue'])();
+        }
         $is_child = 'wooms_process_order_webhook' === $hook;
         if (!$is_child) {
             $batch['parent_calls']++;
@@ -81,6 +86,9 @@ beforeEach(function () use (&$batch): void {
         }
         $id = $persist($hook, $args, $group);
         $batch['enqueued'][] = array('id' => $id, 'hook' => $hook, 'args' => $args);
+        if (is_callable($batch['on_persist'])) {
+            ($batch['on_persist'])();
+        }
         if ($parent_fails_here && 'persist then throw' === $batch['parent_failure']) {
             throw new RuntimeException('Test exception after a durable dispatcher insert');
         }
@@ -208,6 +216,142 @@ it('validates every event before accepting new or completed batches', function (
     expect(get_transient($batch['replay_key']))->toBe($completed ? 'processed' : false);
     expect($batch['http_calls'])->toBe(0);
 })->with(array(false, true));
+
+it('rejects overlapping deliveries without acknowledging unfinished work', function (bool $multiple) use (&$batch, $receive_batch): void {
+    $uuids = $multiple ? $batch['uuids'] : array($batch['uuids'][0]);
+    $nested = null;
+    $batch['on_enqueue'] = static function () use (&$batch, $receive_batch, $uuids, &$nested): void {
+        $batch['on_enqueue'] = null;
+        $nested = $receive_batch($uuids);
+    };
+    expect($receive_batch($uuids)->get_status())->toBe(204);
+    expect($nested->get_status())->toBe(409);
+    expect(count($batch['enqueued']))->toBe(1);
+    expect($receive_batch($uuids)->get_status())->toBe(204);
+    expect(count($batch['enqueued']))->toBe(1);
+    expect($batch['http_calls'])->toBe(0);
+})->with(array(false, true));
+
+it('releases a malformed delivery so its corrected retry can run', function () use (&$batch, $receive_batch): void {
+    expect($receive_batch($batch['uuids'], true)->get_status())->toBe(400);
+    expect($receive_batch($batch['uuids'])->get_status())->toBe(204);
+    expect(count($batch['enqueued']))->toBe(1);
+});
+
+it('serializes concurrent producers before and after a child insert', function (bool $persisted) use (&$batch, $receive_batch, $children): void {
+    expect($receive_batch($batch['uuids'])->get_status())->toBe(204);
+    $job = $batch['enqueued'][0];
+    $slot = $persisted ? 'on_persist' : 'on_enqueue';
+    $nested_failure = null;
+    $batch[$slot] = static function () use (&$batch, $slot, $job, &$nested_failure): void {
+        $batch[$slot] = null;
+        try {
+            do_action($job['hook'], ...array_values($job['args']));
+        } catch (RuntimeException $exception) {
+            $nested_failure = $exception;
+        }
+    };
+    do_action($job['hook'], ...array_values($job['args']));
+    expect(count($children()))->toBe(2);
+    if ($persisted) {
+        expect($nested_failure)->toBeNull();
+        expect($batch['retries'])->toBe(array());
+    } else {
+        expect($nested_failure)->toBeInstanceOf(RuntimeException::class);
+        expect(count($batch['retries']))->toBe(1);
+        $retry = $batch['retries'][0];
+        do_action($retry['hook'], ...array_values($retry['args']));
+        expect(count($children()))->toBe(2);
+    }
+    expect($batch['http_calls'])->toBe(0);
+})->with(array(false, true));
+
+it('does not acknowledge or release a request after another owner takes over', function () use (&$batch, $receive_batch): void {
+    global $wpdb;
+    $resource = 'request:' . $batch['request_id'];
+    $key = 'wooms_webhook_lock_' . hash('sha256', $resource);
+    $rival = null;
+    $batch['on_enqueue'] = static function () use (&$batch, $resource, $key, &$rival): void {
+        global $wpdb;
+        $batch['on_enqueue'] = null;
+        $wpdb->update($wpdb->options, array('option_value' => (time() - 1) . '|expired'), array('option_name' => $key));
+        $rival = WooMS\OrderWebhookLock::acquire($resource);
+    };
+    try {
+        expect($receive_batch($batch['uuids'])->get_status())->toBe(503);
+        expect($rival)->toBeInstanceOf(WooMS\OrderWebhookLock::class);
+        expect(get_transient($batch['replay_key']))->toBe(false);
+        expect($receive_batch($batch['uuids'])->get_status())->toBe(409);
+        expect(count($batch['enqueued']))->toBe(1);
+    } finally {
+        if ($rival instanceof WooMS\OrderWebhookLock) {
+            $rival->release();
+        }
+    }
+    expect($receive_batch($batch['uuids'])->get_status())->toBe(204);
+    expect(count($batch['enqueued']))->toBe(1);
+});
+
+it('rechecks completion after acquiring the request lock', function () use (&$batch, $receive_batch): void {
+    $key = 'wooms_webhook_lock_' . hash('sha256', 'request:' . $batch['request_id']);
+    $done = false;
+    $filter = static function ($query) use (&$batch, $key, &$done) {
+        if (!$done && 0 === stripos(ltrim($query), 'INSERT') && false !== strpos($query, $key)) {
+            $done = true;
+            set_transient($batch['replay_key'], 'processed', DAY_IN_SECONDS);
+        }
+        return $query;
+    };
+    add_filter('query', $filter);
+    try {
+        expect($receive_batch($batch['uuids'])->get_status())->toBe(204);
+        expect($done)->toBeTrue();
+        expect($batch['enqueued'])->toBe(array());
+        expect($batch['http_calls'])->toBe(0);
+    } finally {
+        remove_filter('query', $filter);
+    }
+});
+
+it('acknowledges completed work even while its former owner still holds the lock', function () use (&$batch, $receive_batch): void {
+    $resource = 'request:' . $batch['request_id'];
+    $owner = WooMS\OrderWebhookLock::acquire($resource);
+    expect($owner)->toBeInstanceOf(WooMS\OrderWebhookLock::class);
+    try {
+        set_transient($batch['replay_key'], 'processed', DAY_IN_SECONDS);
+        expect($receive_batch($batch['uuids'])->get_status())->toBe(204);
+        expect($batch['enqueued'])->toBe(array());
+        expect(WooMS\OrderWebhookLock::acquire($resource))->toBeInstanceOf(WP_Error::class);
+    } finally {
+        $owner->release();
+    }
+});
+
+it('releases the request lock after a throwable before enqueue', function () use (&$batch, $receive_batch): void {
+    $filter = static function ($source): void {
+        if (OrderUpdateFromMoySklad::class === $source) {
+            throw new TypeError('Test receive hook error');
+        }
+    };
+    add_action('wooms_logger', $filter);
+    try {
+        expect($receive_batch($batch['uuids'])->get_status())->toBe(503);
+        expect(get_transient($batch['replay_key']))->toBe(false);
+        expect($batch['enqueued'])->toBe(array());
+    } finally {
+        remove_action('wooms_logger', $filter);
+    }
+    expect($receive_batch($batch['uuids'])->get_status())->toBe(204);
+});
+
+it('releases a rate-limited delivery without accepting or enqueueing it', function () use (&$batch, $receive_batch): void {
+    set_transient($batch['rate_key'], 120, MINUTE_IN_SECONDS);
+    expect($receive_batch($batch['uuids'])->get_status())->toBe(429);
+    expect($batch['enqueued'])->toBe(array());
+    expect(get_transient($batch['replay_key']))->toBe(false);
+    delete_transient($batch['rate_key']);
+    expect($receive_batch($batch['uuids'])->get_status())->toBe(204);
+});
 
 it('splits a large notification into bounded dispatcher arguments', function () use (&$batch, $receive_batch, $children): void {
     $batch['request_id'] = str_repeat('r', 128);
