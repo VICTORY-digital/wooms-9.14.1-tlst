@@ -86,3 +86,30 @@ it('reports retry queue failures without claiming a persisted action', function 
         remove_filter('pre_as_schedule_single_action', $filter);
     }
 })->with(array('zero', 'negative id', 'exception'));
+
+it('persists the remaining batch with the dispatcher retry delay and argument order', function (int $attempt, int $delay): void {
+    $captured = array();
+    $filter = static function ($preempt, $timestamp, $hook, $args, $group) use (&$captured) {
+        $captured = compact('timestamp', 'hook', 'args', 'group');
+        return 321;
+    };
+    add_filter('pre_as_schedule_single_action', $filter, 10, 5);
+
+    try {
+        $started = time();
+        $result = OrderWebhookRetries::schedule_batch_retry('request-id', array(2 => 'remaining-order-uuid'), $attempt);
+
+        expect($result)->toBe(321);
+        expect($captured['hook'])->toBe('wooms_dispatch_order_webhook_batch');
+        expect($captured['group'])->toBe('WooMS');
+        expect($captured['args'])->toBe(array(
+            'request_id' => 'request-id',
+            'order_uuids' => array('remaining-order-uuid'),
+            'attempt' => $attempt + 1,
+        ));
+        expect($captured['timestamp'] >= $started + $delay)->toBeTrue();
+        expect($captured['timestamp'] <= time() + $delay)->toBeTrue();
+    } finally {
+        remove_filter('pre_as_schedule_single_action', $filter, 10);
+    }
+})->with(array(array(0, 30), array(1, 120), array(2, 300)));

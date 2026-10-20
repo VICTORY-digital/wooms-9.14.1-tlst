@@ -18,10 +18,13 @@ class OrderUpdateFromMoySklad
      */
     public static $hook_order_update_from_moysklad = 'wooms_order_update_from_moysklad';
     public static $hook_process_webhook = 'wooms_process_order_webhook';
+    public static $hook_dispatch_webhook_batch = 'wooms_dispatch_order_webhook_batch';
     public static $state_key = 'wooms_order_update_from_moysklad_state';
     private static $webhook_secret_option = 'wooms_webhook_secret';
     private static $webhook_replay_prefix = 'wooms_webhook_replay_';
     private static $webhook_rate_prefix = 'wooms_webhook_rate_';
+    // Leave room below the Action Scheduler DB store's 8000-byte JSON args limit.
+    private const WEBHOOK_BATCH_ARGS_BUDGET = 7000;
 
     /**
      * The init
@@ -48,6 +51,7 @@ class OrderUpdateFromMoySklad
 
         add_action('rest_api_init', array(__CLASS__, 'add_route'));
         add_action(self::$hook_process_webhook, array(__CLASS__, 'process_order_webhook'), 10, 4);
+        add_action(self::$hook_dispatch_webhook_batch, array(__CLASS__, 'dispatch_order_webhook_batch'), 10, 3);
 
         add_action('init', array(__CLASS__, 'add_schedule_hook'));
 
@@ -957,40 +961,46 @@ class OrderUpdateFromMoySklad
                 return new \WP_REST_Response(array('error' => 'Webhook processing is disabled'), 503);
             }
 
-            if (empty($data["events"][0]["meta"]["href"])) {
+            $events = is_array($data) ? ($data['events'] ?? null) : null;
+            if (!is_array($events) || empty($events) || array_keys($events) !== range(0, count($events) - 1)) {
                 self::release_webhook_request($data_request);
                 return new \WP_REST_Response(array('error' => 'Invalid webhook payload'), 400);
             }
 
-            $order_path = MoySkladApiUrl::get_customer_order_path($data["events"][0]["meta"]["href"]);
-            if (false === $order_path) {
-                do_action(
-                    'wooms_logger_error',
-                    __CLASS__,
-                    'Отклонен webhook с небезопасным адресом заказа МойСклад'
-                );
+            $order_uuids = array();
+            foreach ($events as $event) {
+                $order_path = MoySkladApiUrl::get_customer_order_path($event['meta']['href'] ?? null);
+                if (false === $order_path) {
+                    do_action(
+                        'wooms_logger_error',
+                        __CLASS__,
+                        'Отклонен webhook с небезопасным адресом заказа МойСклад'
+                    );
 
-                self::release_webhook_request($data_request);
-                return new \WP_REST_Response(array('error' => 'Invalid webhook payload'), 400);
+                    self::release_webhook_request($data_request);
+                    return new \WP_REST_Response(array('error' => 'Invalid webhook payload'), 400);
+                }
+                $order_uuids[] = basename($order_path);
             }
+            $order_uuids = array_values(array_unique($order_uuids));
 
             if ($already_processed) {
                 return new \WP_REST_Response(null, 204);
             }
 
-            $order_uuid = basename($order_path);
+            if (count($order_uuids) > 1) {
+                return self::enqueue_webhook_request(
+                    $data_request,
+                    self::$hook_dispatch_webhook_batch,
+                    self::get_webhook_batch_args($request_id, $order_uuids),
+                    true
+                );
+            }
 
-            $args   = array(
-                'numberposts' => 1,
-                'post_type'   => 'shop_order',
-                'post_status' => 'any',
-                'meta_key'    => 'wooms_id',
-                'meta_value'  => $order_uuid,
-            );
-            $orders = get_posts($args);
+            $order_uuid = $order_uuids[0];
+            $order_id = self::find_webhook_order_id($order_uuid);
 
-
-            if (empty($orders[0]->ID)) {
+            if (!$order_id) {
                 do_action(
                     'wooms_logger',
                     __CLASS__,
@@ -1000,8 +1010,6 @@ class OrderUpdateFromMoySklad
                 return new \WP_REST_Response(null, 204);
             }
 
-            $order_id = $orders[0]->ID;
-
             //Если стоит блокировка обновления Заказа, то выходим (защита от состояния гонки)
             if (get_post_meta($order_id, 'lock_callback_update', true)) {
                 delete_post_meta($order_id, 'lock_callback_update');
@@ -1009,42 +1017,164 @@ class OrderUpdateFromMoySklad
                 return new \WP_REST_Response(array('success' => 'Order update is already locked'), 200);
             }
 
-            $action_id = 0;
-            $queue_error = 'Action Scheduler did not return a persisted action ID';
-            try {
-                $action_id = as_enqueue_async_action(
-                    self::$hook_process_webhook,
-                    array('order_id' => $order_id, 'order_uuid' => $order_uuid, 'request_id' => $request_id),
-                    'WooMS'
-                );
-            } catch (\Throwable $exception) {
-                $queue_error = $exception->getMessage();
-            }
-
-            if (!is_int($action_id) || $action_id <= 0) {
-                self::release_webhook_request($data_request);
-                do_action(
-                    'wooms_logger_error',
-                    __CLASS__,
-                    sprintf('Веб-хук %s не поставлен в фоновую очередь', $request_id),
-                    array('phase' => 'enqueue', 'request_id' => $request_id, 'order_id' => $order_id, 'order_uuid' => $order_uuid, 'error' => $queue_error)
-                );
-                return new \WP_REST_Response(array('error' => 'Webhook could not be queued'), 503);
-            }
-
-            self::mark_webhook_processed($data_request);
-            do_action(
-                'wooms_logger',
-                __CLASS__,
-                sprintf('Веб-хук %s принят в фоновую очередь: задача %d, заказ %d', $request_id, $action_id, $order_id)
+            return self::enqueue_webhook_request(
+                $data_request,
+                self::$hook_process_webhook,
+                array(self::get_webhook_order_args($order_id, $order_uuid, $request_id))
             );
-            return new \WP_REST_Response(null, 204);
         } catch (Exception $e) {
             self::release_webhook_request($data_request);
             $response = new \WP_REST_Response(array('fail', $e->getMessage()));
             $response->set_status(500);
             return $response;
         }
+    }
+
+    /** Acknowledge a notification only after all of its initial actions were persisted. */
+    private static function enqueue_webhook_request($request, $hook, array $action_args, $check_existing = false)
+    {
+        $action_ids = array();
+        $args = $action_args[0];
+        $request_id = $args['request_id'];
+        try {
+            foreach ($action_args as $args) {
+                $action_ids[] = self::enqueue_webhook_action($hook, $args, $check_existing);
+            }
+        } catch (\Throwable $exception) {
+            self::release_webhook_request($request);
+            do_action(
+                'wooms_logger_error',
+                __CLASS__,
+                sprintf('Веб-хук %s не поставлен в фоновую очередь', $request_id),
+                array_merge($args, array('phase' => 'enqueue', 'error' => $exception->getMessage(), 'accepted_action_ids' => $action_ids))
+            );
+            return new \WP_REST_Response(array('error' => 'Webhook could not be queued'), 503);
+        }
+
+        self::mark_webhook_processed($request);
+        do_action(
+            'wooms_logger',
+            __CLASS__,
+            sprintf('Веб-хук %s принят в фоновую очередь: задачи %s', $request_id, implode(', ', $action_ids))
+        );
+        return new \WP_REST_Response(null, 204);
+    }
+
+    /** Keep chunk planning stable across provider retries, independent of local order state. */
+    private static function get_webhook_batch_args($request_id, array $order_uuids)
+    {
+        $actions = array();
+        // Include attempt from the start: retries 0..3 have the same serialized size.
+        $args = array('request_id' => $request_id, 'order_uuids' => array(), 'attempt' => 0);
+        foreach ($order_uuids as $order_uuid) {
+            $args['order_uuids'][] = $order_uuid;
+            if (strlen(wp_json_encode($args)) > self::WEBHOOK_BATCH_ARGS_BUDGET) {
+                array_pop($args['order_uuids']);
+                $actions[] = $args;
+                $args['order_uuids'] = array($order_uuid);
+            }
+        }
+        $actions[] = $args;
+        return $actions;
+    }
+
+    /** Resolve ambiguous inserts before retrying; sequential replays can reuse retained AS records. */
+    private static function enqueue_webhook_action($hook, array $args, $check_existing)
+    {
+        if ($check_existing) {
+            $accepted_id = self::find_accepted_webhook_action($hook, $args);
+            if ($accepted_id) {
+                return $accepted_id;
+            }
+        }
+
+        $action_id = 0;
+        $queue_error = 'Action Scheduler did not return a persisted action ID';
+        try {
+            $action_id = as_enqueue_async_action($hook, $args, 'WooMS');
+        } catch (\Throwable $exception) {
+            $queue_error = $exception->getMessage();
+        }
+        if (is_int($action_id) && $action_id > 0) {
+            return $action_id;
+        }
+        if ($check_existing) {
+            $accepted_id = self::find_accepted_webhook_action($hook, $args);
+            if ($accepted_id) {
+                return $accepted_id;
+            }
+        }
+        throw new \RuntimeException($queue_error);
+    }
+
+    private static function find_webhook_order_id($order_uuid)
+    {
+        $orders = get_posts(array(
+            'numberposts' => 1,
+            'post_type' => 'shop_order',
+            'post_status' => 'any',
+            'meta_key' => 'wooms_id',
+            'meta_value' => $order_uuid,
+        ));
+        return empty($orders[0]->ID) ? 0 : $orders[0]->ID;
+    }
+
+    private static function get_webhook_order_args($order_id, $order_uuid, $request_id)
+    {
+        return array('order_id' => $order_id, 'order_uuid' => $order_uuid, 'request_id' => $request_id);
+    }
+
+    /**
+     * Fan out a validated notification without delaying the provider's HTTP response.
+     *
+     * @internal
+     * @param string $request_id Provider notification ID.
+     * @param string[] $order_uuids Distinct validated MoySklad order UUIDs.
+     * @param int $attempt Persisted dispatcher retry number, initially zero.
+     */
+    public static function dispatch_order_webhook_batch($request_id, $order_uuids, $attempt = 0)
+    {
+        $remaining = array_values($order_uuids);
+        try {
+            while ($remaining) {
+                $order_uuid = $remaining[0];
+                $order_id = self::find_webhook_order_id($order_uuid);
+                if ($order_id) {
+                    $args = self::get_webhook_order_args($order_id, $order_uuid, $request_id);
+                    self::enqueue_webhook_action(self::$hook_process_webhook, $args, true);
+                }
+                // Callback locks belong to the child worker, so dispatcher retries cannot consume them twice.
+                array_shift($remaining);
+            }
+        } catch (\Throwable $exception) {
+            $retry = OrderWebhookRetries::schedule_batch_retry($request_id, $remaining, $attempt);
+            self::report_webhook_failure($exception, $retry, array(
+                'phase' => 'dispatch',
+                'request_id' => $request_id,
+                'order_uuids' => $remaining,
+                'attempt' => $attempt,
+                'error' => $exception->getMessage(),
+            ));
+        }
+    }
+
+    /** Include finished actions so sequential replays do not enqueue accepted work again. */
+    private static function find_accepted_webhook_action($hook, array $args)
+    {
+        $ids = as_get_scheduled_actions(array(
+            'hook' => $hook,
+            'args' => $args,
+            'group' => 'WooMS',
+            'status' => array(
+                \ActionScheduler_Store::STATUS_PENDING,
+                \ActionScheduler_Store::STATUS_RUNNING,
+                \ActionScheduler_Store::STATUS_COMPLETE,
+                \ActionScheduler_Store::STATUS_FAILED,
+                \ActionScheduler_Store::STATUS_CANCELED,
+            ),
+            'per_page' => 1,
+        ), 'ids');
+        return empty($ids) ? 0 : (int) reset($ids);
     }
 
     /**
@@ -1071,22 +1201,29 @@ class OrderUpdateFromMoySklad
                 'attempt' => $attempt,
                 'error' => $exception->getMessage(),
             );
-            if (is_wp_error($retry)) {
-                $context['retry_error_code'] = $retry->get_error_code();
-                $context['retry_error'] = $retry->get_error_message();
-                $message = 'wooms_webhook_retries_exhausted' === $retry->get_error_code()
-                    ? sprintf('Веб-хук %s: попытки обработки исчерпаны', $request_id)
-                    : sprintf('Веб-хук %s: не удалось назначить повтор (%s)', $request_id, $retry->get_error_message());
-            } else {
-                $context['retry_action_id'] = $retry;
-                $context['next_attempt'] = $attempt + 1;
-                $message = sprintf('Веб-хук %s: ошибка попытки %d, назначен повтор %d (задача %d)', $request_id, $attempt + 1, $attempt + 1, $retry);
-            }
-            do_action('wooms_logger_error', __CLASS__, $message, $context);
-
-            // Retain the failed source action in Action Scheduler, including the retry decision.
-            throw new \RuntimeException($message . ': ' . $exception->getMessage(), 0, $exception);
+            self::report_webhook_failure($exception, $retry, $context);
         }
+    }
+
+    /** Report the retry decision and leave the source action failed in Action Scheduler. */
+    private static function report_webhook_failure($exception, $retry, array $context)
+    {
+        $request_id = $context['request_id'];
+        $attempt = $context['attempt'];
+        if (is_wp_error($retry)) {
+            $context['retry_error_code'] = $retry->get_error_code();
+            $context['retry_error'] = $retry->get_error_message();
+            $message = 'wooms_webhook_retries_exhausted' === $retry->get_error_code()
+                ? sprintf('Веб-хук %s: попытки обработки исчерпаны', $request_id)
+                : sprintf('Веб-хук %s: не удалось назначить повтор (%s)', $request_id, $retry->get_error_message());
+        } else {
+            $context['retry_action_id'] = $retry;
+            $context['next_attempt'] = $attempt + 1;
+            $message = sprintf('Веб-хук %s: ошибка попытки %d, назначен повтор %d (задача %d)', $request_id, $attempt + 1, $attempt + 1, $retry);
+        }
+        do_action('wooms_logger_error', __CLASS__, $message, $context);
+
+        throw new \RuntimeException($message . ': ' . $exception->getMessage(), 0, $exception);
     }
 
     /**

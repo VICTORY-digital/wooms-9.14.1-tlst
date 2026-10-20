@@ -12,6 +12,7 @@ defined('ABSPATH') || exit;
 final class OrderWebhookRetries
 {
     const HOOK_NAME = 'wooms_process_order_webhook';
+    const BATCH_HOOK_NAME = 'wooms_dispatch_order_webhook_batch';
 
     /** @var int[] Delays before the first, second, and third retry, in seconds. */
     private static $retry_delays = array(30, 120, 300);
@@ -30,6 +31,31 @@ final class OrderWebhookRetries
      */
     public static function schedule_retry($order_id, $order_uuid, $request_id, $attempt = 0)
     {
+        return self::schedule_action_retry(self::HOOK_NAME, array(
+            'order_id' => $order_id,
+            'order_uuid' => $order_uuid,
+            'request_id' => $request_id,
+        ), $attempt);
+    }
+
+    /**
+     * Retry only the part of a notification not yet accepted by the child queue.
+     *
+     * @param string $request_id Provider notification ID.
+     * @param string[] $order_uuids Remaining validated MoySklad order UUIDs.
+     * @param int $attempt Number of the dispatcher attempt that just failed.
+     * @return int|\WP_Error
+     */
+    public static function schedule_batch_retry($request_id, array $order_uuids, $attempt = 0)
+    {
+        return self::schedule_action_retry(self::BATCH_HOOK_NAME, array(
+            'request_id' => $request_id,
+            'order_uuids' => array_values($order_uuids),
+        ), $attempt);
+    }
+
+    private static function schedule_action_retry($hook, array $args, $attempt)
+    {
         if (!is_int($attempt) || $attempt < 0) {
             return new \WP_Error('wooms_webhook_invalid_attempt', 'Invalid webhook retry attempt.');
         }
@@ -38,18 +64,14 @@ final class OrderWebhookRetries
         }
 
         $next_attempt = $attempt + 1;
+        $args['attempt'] = $next_attempt;
         $action_id = 0;
         $error_message = 'Could not persist webhook retry.';
         try {
             $action_id = as_schedule_single_action(
                 time() + self::$retry_delays[$attempt],
-                self::HOOK_NAME,
-                array(
-                    'order_id' => $order_id,
-                    'order_uuid' => $order_uuid,
-                    'request_id' => $request_id,
-                    'attempt' => $next_attempt,
-                ),
+                $hook,
+                $args,
                 'WooMS'
             );
         } catch (\Throwable $exception) {
@@ -60,7 +82,7 @@ final class OrderWebhookRetries
             return new \WP_Error(
                 'wooms_webhook_retry_queue_failed',
                 $error_message,
-                array('request_id' => $request_id, 'attempt' => $next_attempt)
+                array('request_id' => $args['request_id'], 'attempt' => $next_attempt)
             );
         }
 
