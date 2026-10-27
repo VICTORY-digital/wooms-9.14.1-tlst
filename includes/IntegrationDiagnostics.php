@@ -32,11 +32,7 @@ final class IntegrationDiagnostics
     /** Observe a completed request without changing the caller's response or making another request. */
     public static function record_api_response($url, $response, $data = null)
     {
-        $context = array();
-        $path = (string) wp_parse_url($url, PHP_URL_PATH);
-        if (preg_match('#^/api/remap/1\.2/([a-z]+/[a-z]+)(?:/|$)#', $path, $matches)) {
-            $context['api_resource'] = $matches[1];
-        }
+        $context = self::api_context($url);
         if (is_wp_error($response)) {
             self::report('api_transport_failed', 'МойСклад: не удалось выполнить запрос к API.', $context);
             return;
@@ -58,6 +54,30 @@ final class IntegrationDiagnostics
         } elseif (204 !== $context['http_status'] && !is_array($data)) {
             self::report('api_invalid_response', 'МойСклад: API вернул пустой или некорректный JSON-ответ.', $context);
         }
+    }
+
+    /** A recoverable rejection belongs in the journal, without sending a premature failure alert. */
+    public static function record_api_retry($url, $attempt, $delay_ms)
+    {
+        self::report('api_rate_limit_retry', 'МойСклад: запрос ограничен по частоте, выполняется повтор после паузы.',
+            self::api_context($url) + array('http_status' => 429, 'attempt' => $attempt, 'retry_delay_ms' => $delay_ms),
+            'warning', false);
+    }
+
+    public static function record_api_recovered($url, $attempt, $status)
+    {
+        self::report('api_rate_limit_recovered', 'МойСклад: повторный запрос после ограничения частоты выполнен.',
+            self::api_context($url) + array('http_status' => $status, 'attempt' => $attempt), 'info', false);
+    }
+
+    private static function api_context($url)
+    {
+        $context = array();
+        $path = (string) wp_parse_url($url, PHP_URL_PATH);
+        if (preg_match('#^/api/remap/1\.2/([a-z]+/[a-z]+)(?:/|$)#', $path, $matches)) {
+            $context['api_resource'] = $matches[1];
+        }
+        return $context;
     }
 
     /** Reuse structured failure decisions already produced by the webhook workers. */
@@ -147,7 +167,7 @@ final class IntegrationDiagnostics
     private static function safe_context(array $context)
     {
         $safe = array();
-        foreach (array('order_id', 'post_id', 'action_id', 'attempt', 'next_attempt', 'retry_action_id', 'http_status', 'timeout_seconds') as $key) {
+        foreach (array('order_id', 'post_id', 'action_id', 'attempt', 'next_attempt', 'retry_action_id', 'http_status', 'timeout_seconds', 'retry_delay_ms') as $key) {
             if (isset($context[$key]) && is_numeric($context[$key]) && $context[$key] >= 0) { $safe[$key] = (int) $context[$key]; }
         }
         foreach (array('request_id', 'order_uuid', 'generation') as $key) {
@@ -174,7 +194,7 @@ final class IntegrationDiagnostics
         return $safe;
     }
 
-    private static function report($code, $message, array $context, $level = 'error')
+    private static function report($code, $message, array $context, $level = 'error', $notify = true)
     {
         if (self::$reporting) { return; }
         self::$reporting = true;
@@ -188,6 +208,7 @@ final class IntegrationDiagnostics
             } catch (\Throwable $exception) {
                 self::fallback_log(wp_json_encode($issue));
             }
+            if (!$notify) { return; }
             /**
              * Safe incident for notification adapters. Enqueue delivery here; do not block the provider's request.
              *

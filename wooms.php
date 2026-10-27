@@ -41,6 +41,7 @@ register_deactivation_hook(__FILE__, function () {
 
 require_once __DIR__.'/includes/MoySkladApiUrl.php';
 require_once __DIR__.'/includes/IntegrationDiagnostics.php';
+require_once __DIR__.'/includes/MoySkladApiRequest.php';
 require_once __DIR__.'/includes/functions.php';
 
 if (defined('WP_CLI') && WP_CLI) {
@@ -175,7 +176,7 @@ function request($path = '', $data = array(), $type = 'GET')
 		'body' => $data,
 	);
 
-	$request = wp_remote_request($url, $args);
+	$request = MoySkladApiRequest::request($url, $args);
 	if (is_wp_error($request)) {
 		IntegrationDiagnostics::record_api_response($url, $request);
 		do_action(

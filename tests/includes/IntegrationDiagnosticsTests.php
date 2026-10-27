@@ -8,6 +8,7 @@ use WooMS\OrderUpdateFromMoySklad;
 $incidents = array();
 beforeEach(function () use (&$incidents): void {
     $incidents = array('issues' => array(), 'actions' => array(), 'original_logging' => get_option('wooms_logger_enable'));
+    $incidents['original_logger'] = wc_get_logger();
     $incidents['logger'] = new class extends WC_Logger {
         public array $records = array();
         public bool $fail = false;
@@ -27,6 +28,11 @@ afterEach(function () use (&$incidents): void {
     IntegrationDiagnostics::clear_action(0);
     remove_filter('woocommerce_logging_class', $incidents['logger_filter']);
     remove_action('wooms_integration_issue', $incidents['listener']);
+    // Removing the filter alone leaves its mock in WooCommerce's static logger cache.
+    $restore_logger = static function () use (&$incidents) { return $incidents['original_logger']; };
+    add_filter('woocommerce_logging_class', $restore_logger, PHP_INT_MAX);
+    wc_get_logger();
+    remove_filter('woocommerce_logging_class', $restore_logger, PHP_INT_MAX);
     if (false === $incidents['original_logging']) { delete_option('wooms_logger_enable'); }
     else { update_option('wooms_logger_enable', $incidents['original_logging']); }
 });

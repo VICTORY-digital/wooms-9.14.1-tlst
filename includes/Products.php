@@ -86,6 +86,9 @@ function walker( $args = [] ) {
 	if ( isset( $data['errors'] ) ) {
 		throw new \Exception( print_r( $data['errors'], true ) );
 	}
+	if ( ! is_array( $data ) || ! isset( $data['rows'] ) || ! is_array( $data['rows'] ) ) {
+		throw new \RuntimeException( 'Invalid MoySklad product list response.' );
+	}
 
 	do_action( 'wooms_logger', __NAMESPACE__, sprintf( 'Отправлен запрос %s', $url ) );
 

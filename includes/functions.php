@@ -54,7 +54,7 @@ function wooms_request($url = '', $data = array(), $type = 'GET')
     'body'        => $data,
   );
 
-  $request = wp_remote_request($url, $args);
+  $request = \WooMS\MoySkladApiRequest::request($url, $args);
   if (is_wp_error($request)) {
     \WooMS\IntegrationDiagnostics::record_api_response($url, $request);
     do_action(
